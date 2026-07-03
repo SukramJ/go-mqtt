@@ -1,3 +1,34 @@
+# Version 0.2.0 (2026-07-03)
+
+## What's Changed
+
+Two changes carried back from the `openccu-loom` transport this module was
+extracted from, where they still lived after the 0.1.0 carve-out.
+
+### Changed (BREAKING)
+
+- **`MessageHandler` now takes a third `retained bool` argument**
+  (`func(topic string, payload []byte, retained bool)`). It carries the MQTT
+  PUBLISH retain bit so a handler with side effects can drop the retained
+  message the broker re-delivers on every (re)connect — without it, a stale
+  `mosquitto_pub -r` command is re-applied to the real device each time the
+  consumer restarts. Consumers that don't care can ignore the parameter
+  (`func(_ string, _ []byte, _ bool)`). This is a source-breaking signature
+  change for every `Subscribe` call site.
+
+### Fixed
+
+- **Subscription replay now preserves the QoS each filter was subscribed at.**
+  The 0.1.0 reconnect path re-subscribed every filter at a hardcoded QoS 1;
+  it now records and replays the caller's requested QoS, so a QoS 0
+  subscription is no longer silently upgraded on reconnect.
+- **The PINGRESP watchdog no longer trips on a single delayed pong.** It now
+  tolerates one unanswered PINGREQ and only declares the socket dead after two
+  consecutive misses (≈ one full KeepAlive). A lone late/dropped PINGRESP — a
+  GC pause, a scheduler stall on a CPU-throttled host, a momentary network
+  blip — previously forced a spurious `mqtt.tcp.ping_timeout` + reconnect;
+  a genuinely half-open socket is still detected, one ping interval later.
+
 # Version 0.1.0 (2026-07-02)
 
 ## What's Changed

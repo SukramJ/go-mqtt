@@ -41,8 +41,10 @@ client := mqtt.NewTCPClient(mqtt.TCPConfig{
 
 lc := mqtt.NewLifecycle(mqtt.DefaultLifecycle(), client)
 lc.OnConnect(func(ctx context.Context) {
-	_ = client.Subscribe(ctx, "cmd/#", mqtt.QoS1, func(topic string, payload []byte) {
-		// handle inbound message
+	_ = client.Subscribe(ctx, "cmd/#", mqtt.QoS1, func(topic string, payload []byte, retained bool) {
+		// handle inbound message; a handler with side effects should skip
+		// retained replays (retained == true) the broker re-delivers on
+		// every (re)connect
 	})
 })
 

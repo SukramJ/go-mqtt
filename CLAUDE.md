@@ -86,12 +86,15 @@ protocol/codec.go        CONNECT/CONNACK/PUBLISH/PUBACK/SUBSCRIBE/SUBACK/UNSUBSC
   "already connected" idempotency short-circuit so a stray reconnect
   attempt against a still-healthy socket doesn't spam warn logs or
   reset the backoff timer.
-- **`MessageHandler` contract**: handlers run **synchronously inline**
-  in `TCPClient.readLoop` — the same goroutine that also decodes
+- **`MessageHandler` contract**: `func(topic string, payload []byte,
+  retained bool)`. Handlers run **synchronously inline** in
+  `TCPClient.readLoop` — the same goroutine that also decodes
   PUBACK/PINGRESP and feeds the keep-alive watchdog. A handler that
   blocks stalls PUBACK/PINGRESP processing and can trip a spurious
-  `ping_timeout`. This contract is documented on the `MessageHandler`
-  type itself — read it before wiring a new consumer.
+  `ping_timeout`. The `retained` flag carries the PUBLISH retain bit so a
+  side-effecting handler can drop the retained replay the broker
+  re-delivers on every (re)connect. This contract is documented on the
+  `MessageHandler` type itself — read it before wiring a new consumer.
 - **`NewClientTLSConfig`** (`tls_config.go`) — always sets `ServerName`
   explicitly (`tls.Client` does not infer it from the dialed address),
   closing the common "just set InsecureSkipVerify" trap.

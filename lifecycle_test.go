@@ -143,6 +143,57 @@ func TestMQTTReconnectAfterPingTimeout(t *testing.T) {
 	}
 }
 
+// TestPingWatchdogToleratesSingleMissedPong verifies the watchdog does
+// NOT tear the connection down on a single unanswered PINGREQ: only after
+// pingTimeoutThreshold consecutive misses is the socket declared dead. A
+// lone dropped PINGRESP — a GC pause, a scheduler stall on a throttled
+// host, a momentary network blip — must be ridden out without a spurious
+// reconnect. Counterpart to TestMQTTReconnectAfterPingTimeout, which pins
+// that a *persistently* silent broker is still detected.
+func TestPingWatchdogToleratesSingleMissedPong(t *testing.T) {
+	broker := newLifecycleMockBroker(t)
+
+	client := NewTCPClient(TCPConfig{
+		BrokerURL: broker.URL(),
+		ClientID:  "lc-ping-tolerate-test",
+		KeepAlive: 30 * time.Second,
+	})
+	// Fast ticks so several ping cycles elapse within the test window.
+	client.pingInterval = 40 * time.Millisecond
+
+	lc := NewLifecycle(fastLifecycleCfg(), client)
+
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+
+	if err := lc.Start(runCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		cancelRun()
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer stopCancel()
+		_ = lc.Stop(stopCtx)
+	})
+
+	if !waitCondition(2*time.Second, func() bool { return broker.ConnCount() >= 1 }) {
+		t.Fatal("broker never saw initial connection")
+	}
+
+	// Drop exactly one PINGREQ, then answer normally again.
+	broker.DropNextPings(1)
+
+	// Across several ping intervals the single miss must NOT force a
+	// reconnect: the connection count stays at 1 and the client stays up.
+	time.Sleep(300 * time.Millisecond) // ~7 ticks at 40ms
+	if got := broker.ConnCount(); got != 1 {
+		t.Fatalf("single missed pong forced a reconnect: conn count = %d, want 1", got)
+	}
+	if !client.IsConnected() {
+		t.Fatal("client dropped its connection after a single missed pong")
+	}
+}
+
 // TestMQTTConnackFailureBackoff verifies that a non-zero CONNACK return
 // code causes the lifecycle to back off and does NOT spam connect
 // attempts faster than InitialBackoff.
@@ -273,7 +324,7 @@ func TestMQTTSubscribeReplayAfterReconnect(t *testing.T) {
 		"homeassistant/status",
 	}
 	for _, f := range topics {
-		if err := client.Subscribe(runCtx, f, QoS1, func(string, []byte) {}); err != nil {
+		if err := client.Subscribe(runCtx, f, QoS1, func(string, []byte, bool) {}); err != nil {
 			t.Fatalf("Subscribe(%q): %v", f, err)
 		}
 	}
@@ -419,7 +470,7 @@ func TestForcedDisconnectKeepsSubscriptions(t *testing.T) {
 
 	// Register subscriptions on the first connection.
 	for _, f := range filters {
-		if err := client.Subscribe(runCtx, f, QoS1, func(string, []byte) {}); err != nil {
+		if err := client.Subscribe(runCtx, f, QoS1, func(string, []byte, bool) {}); err != nil {
 			t.Fatalf("Subscribe(%q): %v", f, err)
 		}
 	}
@@ -450,6 +501,60 @@ func TestForcedDisconnectKeepsSubscriptions(t *testing.T) {
 			"subscribe replay incomplete: broker total=%d, want≥%d",
 			broker.SubscribeCount(), baseSubs+len(filters),
 		)
+	}
+}
+
+// TestSubscribeReplayPreservesQoS verifies that a filter subscribed at a
+// non-default QoS is replayed on reconnect at that same QoS, not silently
+// forced to a fixed level. Subscribes at QoS0, forces a TCP reset, and
+// asserts every SUBSCRIBE the broker saw — initial and replayed — carried
+// QoS0.
+func TestSubscribeReplayPreservesQoS(t *testing.T) {
+	t.Parallel()
+
+	broker := newLifecycleMockBroker(t)
+
+	client := NewTCPClient(TCPConfig{
+		BrokerURL: broker.URL(),
+		ClientID:  "lc-qos-replay-test",
+		KeepAlive: 30 * time.Second,
+	})
+
+	lc := NewLifecycle(fastLifecycleCfg(), client)
+
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	defer cancelRun()
+
+	if err := lc.Start(runCtx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() {
+		cancelRun()
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer stopCancel()
+		_ = lc.Stop(stopCtx)
+	})
+
+	// QoS0 is the non-default level; a hardcoded QoS1 replay would show
+	// up here as a mismatch.
+	if err := client.Subscribe(runCtx, "gh/ccu1/state", QoS0, func(string, []byte, bool) {}); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	if !waitCondition(2*time.Second, func() bool { return broker.SubscribeCount() >= 1 }) {
+		t.Fatalf("broker never saw initial subscribe")
+	}
+	initial := broker.SubscribeCount()
+
+	broker.InjectTCPReset()
+
+	if !waitCondition(3*time.Second, func() bool { return broker.SubscribeCount() > initial }) {
+		t.Fatalf("subscribe not replayed after reset; got %d", broker.SubscribeCount())
+	}
+
+	for i, q := range broker.SubscribeQoS() {
+		if q != byte(QoS0) {
+			t.Fatalf("SUBSCRIBE #%d used QoS %d, want 0 (replay must preserve the requested QoS)", i, q)
+		}
 	}
 }
 

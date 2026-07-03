@@ -23,6 +23,16 @@ type Publisher interface {
 
 // MessageHandler is invoked for every message a subscription receives.
 //
+// The retained flag carries the MQTT PUBLISH "retain" bit (§3.3.1.3) so
+// a handler that performs side effects on inbound commands can drop
+// retained replays from the broker. On every (re)connect the broker
+// re-delivers the last retained message on each subscribed filter;
+// without this flag a handler cannot tell that replay apart from a
+// fresh command, so an old `mosquitto_pub -r` left over from a previous
+// test or automation is re-applied to the real device every time the
+// consumer restarts. Consumers that don't care (pure state sinks) can
+// simply ignore the parameter.
+//
 // Contract: the [TCPClient] adapter calls the handler synchronously,
 // inline in its read loop (see TCPClient.dispatch), which is the same
 // goroutine that decodes PUBACK and PINGRESP frames and feeds the
@@ -33,7 +43,7 @@ type Publisher interface {
 // behind it and the keep-alive watchdog can declare the connection
 // lost (spurious `ping_timeout`) even though the broker and network
 // are fine.
-type MessageHandler func(topic string, payload []byte)
+type MessageHandler func(topic string, payload []byte, retained bool)
 
 // Subscriber is the inbound contract — subscribe to a topic filter
 // and route matching messages to a handler. Wiring typically happens

@@ -48,6 +48,11 @@ type lifecycleMockBroker struct {
 	// client's PINGRESP watchdog.
 	dropPings atomic.Bool
 
+	// dropPingsRemaining is a countdown of PINGREQ frames to swallow
+	// before answering normally again — used to verify the watchdog
+	// rides out a bounded number of missed PINGRESPs.
+	dropPingsRemaining atomic.Int32
+
 	// subCount is the total number of SUBSCRIBE frames received across
 	// all connections.
 	subCount atomic.Int32
@@ -57,6 +62,10 @@ type lifecycleMockBroker struct {
 
 	mu      sync.Mutex
 	current net.Conn // active connection; nil when no client is connected
+	// subQoS records the requested-QoS byte of every SUBSCRIBE frame,
+	// in receive order, so a test can assert reconnect replay preserved
+	// the original delivery level instead of forcing a fixed QoS.
+	subQoS []byte
 }
 
 // newLifecycleMockBroker starts a listener on a random local port and
@@ -98,6 +107,14 @@ func (b *lifecycleMockBroker) DropPings(v bool) {
 	b.dropPings.Store(v)
 }
 
+// DropNextPings makes the broker swallow the next n PINGREQ frames
+// without replying, then answer normally again — used to verify the
+// watchdog tolerates a bounded number of missed PINGRESPs before
+// declaring the connection dead.
+func (b *lifecycleMockBroker) DropNextPings(n int) {
+	b.dropPingsRemaining.Store(int32(n)) //nolint:gosec // test-only, small literal counts
+}
+
 // RejectNextConnect configures the broker to send a CONNACK with
 // return code 0x05 (connection refused, not authorised) on the next
 // incoming CONNECT packet, then revert to accepting.
@@ -109,6 +126,16 @@ func (b *lifecycleMockBroker) RejectNextConnect() {
 // across all connections since the broker was created.
 func (b *lifecycleMockBroker) SubscribeCount() int {
 	return int(b.subCount.Load())
+}
+
+// SubscribeQoS returns the requested-QoS byte of every SUBSCRIBE frame
+// the broker has seen, in receive order.
+func (b *lifecycleMockBroker) SubscribeQoS() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]byte, len(b.subQoS))
+	copy(out, b.subQoS)
+	return out
 }
 
 // ConnCount returns the total number of accepted TCP connections.
@@ -165,6 +192,12 @@ func (b *lifecycleMockBroker) serve(conn net.Conn) {
 
 		case protocol.PacketSubscribe:
 			b.subCount.Add(1)
+			// The requested QoS is the trailing byte of the SUBSCRIBE
+			// payload (2-byte packet id + 2-byte filter length + filter
+			// + 1-byte QoS). Record it for the replay-preserves-QoS test.
+			b.mu.Lock()
+			b.subQoS = append(b.subQoS, frame.Body[len(frame.Body)-1])
+			b.mu.Unlock()
 			// Send SUBACK so the client is not left waiting.
 			body := []byte{frame.Body[0], frame.Body[1], 0x01}
 			_ = lcmWritePacket(bw, byte(protocol.PacketSuback)<<4, body)
@@ -173,6 +206,10 @@ func (b *lifecycleMockBroker) serve(conn net.Conn) {
 		case protocol.PacketPingreq:
 			if b.dropPings.Load() {
 				continue // half-open simulation: never answer the ping
+			}
+			if b.dropPingsRemaining.Load() > 0 {
+				b.dropPingsRemaining.Add(-1)
+				continue // bounded miss: swallow this ping, answer the next
 			}
 			_ = lcmWritePacket(bw, byte(protocol.PacketPingresp)<<4, nil)
 			_ = bw.Flush()

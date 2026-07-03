@@ -40,6 +40,16 @@ type TCPConfig struct {
 	Logger       *slog.Logger
 }
 
+// subscriberEntry stores the handler and the QoS level a filter was
+// originally subscribed at. The QoS is replayed on reconnect so every
+// filter is restored at the same delivery guarantee the caller
+// requested, rather than being silently upgraded/downgraded to a fixed
+// level.
+type subscriberEntry struct {
+	handler MessageHandler
+	qos     QoS
+}
+
 // TCPClient is a pure-Go MQTT 3.1.1 client used by the Bridge's
 // Lifecycle.
 //
@@ -61,7 +71,7 @@ type TCPClient struct {
 	acks  map[uint16]chan struct{}
 
 	subMu       sync.RWMutex
-	subscribers map[string]MessageHandler
+	subscribers map[string]subscriberEntry
 
 	sendMu sync.Mutex // serialises frame writes
 
@@ -69,11 +79,16 @@ type TCPClient struct {
 	// bounds the PINGRESP watchdog window. Defaults to KeepAlive/2 in
 	// NewTCPClient; tests override it directly to avoid the 30s floor.
 	pingInterval time.Duration
-	// pingOutstanding is true between sending a PINGREQ and receiving
-	// its PINGRESP. If it is still set when the next ticker fires, the
-	// broker has gone silent on a half-open socket and the connection
-	// is declared lost.
-	pingOutstanding atomic.Bool
+	// outstandingPings counts PINGREQs sent since the last PINGRESP was
+	// observed: keepAliveLoop increments it after each ping, readLoop
+	// resets it to 0 on any PINGRESP. The socket is declared dead only
+	// once it reaches pingTimeoutThreshold — i.e. two consecutive pings
+	// (≈ one full KeepAlive at the default pingInterval) go unanswered —
+	// so a single delayed or dropped PINGRESP (a GC pause, a scheduler
+	// stall on a CPU-throttled host, a momentary network blip) does not
+	// trip a spurious `ping_timeout` + reconnect. A genuinely half-open
+	// socket is still detected, just one pingInterval later.
+	outstandingPings atomic.Int32
 
 	stop    chan struct{}
 	stopped atomic.Bool
@@ -133,7 +148,7 @@ func NewTCPClient(cfg TCPConfig) *TCPClient {
 		cfg:          cfg,
 		logger:       cfg.Logger,
 		acks:         make(map[uint16]chan struct{}),
-		subscribers:  make(map[string]MessageHandler),
+		subscribers:  make(map[string]subscriberEntry),
 		stop:         make(chan struct{}),
 		lostCh:       make(chan struct{}, 1),
 		pingInterval: cfg.KeepAlive / 2,
@@ -211,7 +226,7 @@ func (c *TCPClient) Connect(ctx context.Context) error {
 	c.stop = make(chan struct{})
 	stopCh := c.stop
 	c.stopped.Store(false)
-	c.pingOutstanding.Store(false)
+	c.outstandingPings.Store(0)
 	c.mu.Unlock()
 	now := time.Now()
 	c.connectedAt.Store(&now)
@@ -227,16 +242,20 @@ func (c *TCPClient) Connect(ctx context.Context) error {
 	// `set_temperature` / `set_mode` / `set_profile` commands
 	// arrive at the broker but are never delivered to the daemon.
 	c.subMu.RLock()
-	filters := make([]string, 0, len(c.subscribers))
-	for f := range c.subscribers {
-		filters = append(filters, f)
+	type filterQoS struct {
+		filter string
+		qos    QoS
+	}
+	subs := make([]filterQoS, 0, len(c.subscribers))
+	for f, entry := range c.subscribers {
+		subs = append(subs, filterQoS{filter: f, qos: entry.qos})
 	}
 	c.subMu.RUnlock()
-	for _, f := range filters {
-		pkt := &protocol.SubscribePacket{PacketID: c.nextPacketID(), TopicFilter: f, QoS: byte(QoS1)}
+	for _, s := range subs {
+		pkt := &protocol.SubscribePacket{PacketID: c.nextPacketID(), TopicFilter: s.filter, QoS: byte(s.qos)}
 		if err := c.writeFrame(pkt); err != nil {
 			c.logger.Warn("mqtt.tcp.resubscribe",
-				slog.String("filter", f),
+				slog.String("filter", s.filter),
 				slog.String("err", err.Error()))
 		}
 	}
@@ -325,7 +344,7 @@ func (c *TCPClient) Subscribe(ctx context.Context, filter string, qos QoS, handl
 		return err
 	}
 	c.subMu.Lock()
-	c.subscribers[filter] = handler
+	c.subscribers[filter] = subscriberEntry{handler: handler, qos: qos}
 	c.subMu.Unlock()
 	_ = ctx
 	return nil
@@ -466,9 +485,9 @@ func (c *TCPClient) readLoop(stop <-chan struct{}) {
 				c.ackMu.Unlock()
 			}
 		case protocol.PacketPingresp:
-			// Heartbeat ack: the broker is alive, so clear the
-			// watchdog flag set when keepAliveLoop sent the PINGREQ.
-			c.pingOutstanding.Store(false)
+			// Heartbeat ack: the broker is alive, so reset the
+			// outstanding-ping counter keepAliveLoop bumps per PINGREQ.
+			c.outstandingPings.Store(0)
 		case protocol.PacketSuback:
 			// Subscribe/unsubscribe calls return as soon as the frame
 			// is on the wire (non-blocking in our MVP — no caller
@@ -497,6 +516,15 @@ func (c *TCPClient) readLoop(stop <-chan struct{}) {
 	}
 }
 
+// pingTimeoutThreshold is how many consecutive unanswered PINGREQs the
+// keep-alive watchdog tolerates before declaring the socket dead. Two
+// (≈ one full KeepAlive at the default pingInterval of KeepAlive/2)
+// rides out a single delayed or dropped PINGRESP — a GC pause, a
+// scheduler stall on a CPU-throttled host, a momentary network blip —
+// without a spurious `ping_timeout` + reconnect, while still catching a
+// genuinely half-open socket within 2×pingInterval.
+const pingTimeoutThreshold = 2
+
 func (c *TCPClient) keepAliveLoop(stop <-chan struct{}) {
 	defer c.wg.Done()
 	ticker := time.NewTicker(c.pingInterval)
@@ -506,15 +534,15 @@ func (c *TCPClient) keepAliveLoop(stop <-chan struct{}) {
 		case <-stop:
 			return
 		case <-ticker.C:
-			// Watchdog: a PINGREQ from the previous tick that never
-			// drew a PINGRESP means the socket is half-open — the
-			// broker or network vanished without a TCP FIN/RST, so
-			// readLoop stays blocked in ReadFrame forever and never
-			// trips handleConnectionLost. Declare the connection lost
-			// so the lifecycle reconnects. Without this, publishes
-			// silently time out on a dead socket until a manual
-			// restart.
-			if c.pingOutstanding.Load() {
+			// Watchdog: PINGREQs from previous ticks that never drew a
+			// PINGRESP mean the socket is half-open — the broker or
+			// network vanished without a TCP FIN/RST, so readLoop stays
+			// blocked in ReadFrame forever and never trips
+			// handleConnectionLost. Once pingTimeoutThreshold pings go
+			// unanswered, declare the connection lost so the lifecycle
+			// reconnects. Without this, publishes silently time out on a
+			// dead socket until a manual restart.
+			if c.outstandingPings.Load() >= pingTimeoutThreshold {
 				c.logger.Warn("mqtt.tcp.ping_timeout")
 				c.handleConnectionLost()
 				return
@@ -539,8 +567,9 @@ func (c *TCPClient) keepAliveLoop(stop <-chan struct{}) {
 				c.handleConnectionLost()
 				return
 			}
-			// Arm the watchdog only after the PINGREQ is on the wire.
-			c.pingOutstanding.Store(true)
+			// Count this ping as outstanding only after it is on the
+			// wire; a PINGRESP resets the counter to 0.
+			c.outstandingPings.Add(1)
 			c.sendMu.Unlock()
 		}
 	}
@@ -593,15 +622,15 @@ func (c *TCPClient) handleConnectionLost() {
 func (c *TCPClient) dispatch(ib *protocol.InboundPublish) {
 	c.subMu.RLock()
 	var handler MessageHandler
-	for filter, h := range c.subscribers {
+	for filter, entry := range c.subscribers {
 		if topicMatches(filter, ib.Topic) {
-			handler = h
+			handler = entry.handler
 			break
 		}
 	}
 	c.subMu.RUnlock()
 	if handler != nil {
-		handler(ib.Topic, ib.Payload)
+		handler(ib.Topic, ib.Payload, ib.Retain)
 	}
 }
 

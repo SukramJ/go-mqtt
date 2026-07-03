@@ -206,7 +206,7 @@ func TestTCPClientSubscribeSendsFrame(t *testing.T) {
 	defer c.Disconnect(ctx) //nolint:errcheck // teardown
 
 	var received []string
-	if err := c.Subscribe(ctx, "cmd/#", QoS1, func(topic string, _ []byte) {
+	if err := c.Subscribe(ctx, "cmd/#", QoS1, func(topic string, _ []byte, _ bool) {
 		received = append(received, topic)
 	}); err != nil {
 		t.Fatalf("subscribe: %v", err)
@@ -257,7 +257,7 @@ func TestTCPClientWarnsOnSubackRejection(t *testing.T) {
 	}
 	defer c.Disconnect(ctx) //nolint:errcheck // teardown
 
-	if err := c.Subscribe(ctx, "cmd/#", QoS1, func(string, []byte) {}); err != nil {
+	if err := c.Subscribe(ctx, "cmd/#", QoS1, func(string, []byte, bool) {}); err != nil {
 		t.Fatalf("subscribe: %v", err)
 	}
 
@@ -294,5 +294,29 @@ func TestTCPClientConnectRejectsBadURL(t *testing.T) {
 	c := NewTCPClient(TCPConfig{BrokerURL: "::::not a url"})
 	if err := c.Connect(context.Background()); err == nil {
 		t.Fatal("expected error")
+	}
+}
+
+// TestDispatchPassesRetainFlag pins the MessageHandler retained-bit
+// contract: dispatch must forward the inbound PUBLISH retain flag
+// verbatim so a consumer can drop retained replays. Exercises dispatch
+// directly (no broker) by seeding the subscriber map, since dispatch
+// only reads c.subscribers.
+func TestDispatchPassesRetainFlag(t *testing.T) {
+	c := NewTCPClient(TCPConfig{BrokerURL: "tcp://127.0.0.1:1", ClientID: "gotest", KeepAlive: 30 * time.Second})
+
+	var got []bool
+	c.subMu.Lock()
+	c.subscribers["a/#"] = subscriberEntry{
+		handler: func(_ string, _ []byte, retained bool) { got = append(got, retained) },
+		qos:     QoS1,
+	}
+	c.subMu.Unlock()
+
+	c.dispatch(&protocol.InboundPublish{Topic: "a/b", Payload: []byte("x"), Retain: true})
+	c.dispatch(&protocol.InboundPublish{Topic: "a/b", Payload: []byte("y"), Retain: false})
+
+	if len(got) != 2 || got[0] != true || got[1] != false {
+		t.Fatalf("retained flags = %v, want [true false]", got)
 	}
 }
