@@ -116,8 +116,15 @@ e2e-certs: ## generate the e2e CA + server TLS cert (idempotent)
 .PHONY: e2e-up
 e2e-up: e2e-certs ## start the e2e mosquitto + emqx docker containers
 	docker rm -f gomqtt-e2e-mosquitto gomqtt-e2e-emqx >/dev/null 2>&1 || true
-	docker run --rm -v $(CURDIR)/e2e/testdata:/work eclipse-mosquitto:2 \
-	  mosquitto_passwd -b -c /work/passwd e2e e2epass
+# Both files are disposable, gitignored test credentials. They must be
+# world-readable: on Linux (CI) the bind mount preserves real ownership,
+# and mosquitto runs as uid 1883 in the container — it cannot read a
+# 0600 key owned by the host user, nor a root-owned passwd, so the
+# broker silently never comes up. The passwd chmod runs inside the
+# container because the file belongs to root there.
+	docker run --rm --entrypoint /bin/sh -v $(CURDIR)/e2e/testdata:/work eclipse-mosquitto:2 \
+	  -c 'rm -f /work/passwd && mosquitto_passwd -b -c /work/passwd e2e e2epass && chmod 0644 /work/passwd'
+	chmod 0644 e2e/testdata/certs/server.key
 	docker run -d --name gomqtt-e2e-mosquitto \
 	  -p 1883:1883 -p 8883:8883 -p 1884:1884 \
 	  -v $(CURDIR)/e2e/testdata:/mosquitto/config:ro \
