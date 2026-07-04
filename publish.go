@@ -30,6 +30,23 @@ func (c *TCPClient) Publish(ctx context.Context, topic string, payload []byte, q
 	if qos > QoS2 {
 		return fmt.Errorf("%w: unsupported QoS %d", protocol.ErrProtocolViolation, qos)
 	}
+
+	var po publishOptions
+	for _, o := range opts {
+		o(&po)
+	}
+	// The Response Topic is a topic name a responder publishes its reply to,
+	// so [MQTT-3.3.2-14] forbids wildcard characters in it. A wildcarded
+	// Response Topic is a §3.3.2.3.5 Protocol Error a conformant broker answers
+	// with a DISCONNECT that tears down the whole connection (and every
+	// in-flight QoS exchange with it); reject it locally like the Maximum QoS /
+	// Retain Available limits below. It is only carried on an MQTT 5.0 link.
+	if c.version == protocol.V50 && po.responseTopic != "" {
+		if err := protocol.ValidateTopicName(po.responseTopic); err != nil {
+			return fmt.Errorf("invalid response topic: %w", err)
+		}
+	}
+
 	l := c.link.Load()
 	if l == nil {
 		return ErrNotConnected
@@ -51,10 +68,6 @@ func (c *TCPClient) Publish(ctx context.Context, topic string, payload []byte, q
 		}
 	}
 
-	var po publishOptions
-	for _, o := range opts {
-		o(&po)
-	}
 	pkt := &protocol.PublishPacket{
 		Version:    c.version,
 		Topic:      topic,
@@ -235,11 +248,17 @@ func (c *TCPClient) requestAck(ctx context.Context, l *link, packet string, mk f
 		return ackResult{}, err
 	}
 	res, werr := c.waitAck(ctx, ch)
-	c.ids.Release(id)
 	if werr != nil {
+		// ctx cancel / ack timeout: remove the waiter BEFORE freeing the id.
+		// Releasing first would let a concurrent Acquire hand this id to
+		// another SUBSCRIBE/UNSUBSCRIBE that registers its own waiter, which
+		// this trailing removeWaiter would then delete — stranding that
+		// request until its own AckTimeout despite a valid broker ack.
 		c.removeWaiter(id)
+		c.ids.Release(id)
 		return ackResult{}, werr
 	}
+	c.ids.Release(id)
 	if res.err != nil {
 		return ackResult{}, res.err
 	}

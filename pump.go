@@ -35,6 +35,18 @@ func (c *TCPClient) readLoop(l *link) {
 			c.teardownLink(l, false)
 			return
 		}
+		if isStopping(l) {
+			// The link was torn down (keep-alive watchdog, server DISCONNECT,
+			// caller Disconnect) while this frame was in flight — and a
+			// reconnect may already have swapped in a new link that shares
+			// c.ids, c.quota and c.store. A bufio.Reader can still surface a
+			// pipelined PUBACK/PUBCOMP from the now-dead socket here; handling
+			// it would run completeOutbound/handlePubrec against the NEW link's
+			// allocator and quota (double-freeing a reused packet id,
+			// over-crediting the send quota past Receive Maximum). Drop it and
+			// exit — teardownLink has already run for this link.
+			return
+		}
 		if err := frame.ValidateFlags(); err != nil {
 			c.logger.Warn("mqtt.tcp.malformed_frame", slog.String("err", err.Error()))
 			c.protocolError(l, protocol.MalformedPacketReason)
