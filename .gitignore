@@ -17,6 +17,11 @@ coverage.*
 *.coverprofile
 profile.cov
 
+# e2e generated assets: TLS certs (make e2e-certs) and the mosquitto
+# password file (make e2e-up) — regenerate, never commit.
+e2e/testdata/certs/
+e2e/testdata/passwd
+
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
@@ -30,3 +35,4 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+/.idea

@@ -8,7 +8,6 @@ import (
 	"errors"
 	"log/slog"
 	"math/rand"
-	"strings"
 	"sync"
 	"time"
 )
@@ -19,6 +18,18 @@ import (
 type Connector interface {
 	Connect(ctx context.Context) error
 	Disconnect(ctx context.Context) error
+}
+
+// ConnectionNotifier is an optional capability a [Connector] may also
+// satisfy to drive the reconnect loop event-driven instead of purely
+// timer-polled. [ConnectionLost] returns a channel that receives a value
+// whenever the underlying session drops. [Lifecycle.loop] selects on it
+// so a detected drop triggers an immediate reconnect attempt rather than
+// waiting out the (possibly [LifecycleConfig.MaxBackoff]) idle-probe
+// timer. [TCPClient] implements this via its buffered, non-blocking
+// ConnectionLost channel.
+type ConnectionNotifier interface {
+	ConnectionLost() <-chan struct{}
 }
 
 // LifecycleConfig governs the reconnect loop.
@@ -78,6 +89,13 @@ func (l *Lifecycle) OnConnect(fn func(context.Context)) {
 // Start boots the reconnect loop and returns once the first connect
 // has succeeded (or ctx was cancelled). Subsequent drops reconnect
 // in the background.
+//
+// ctx governs the WHOLE reconnect loop, not just the initial connect:
+// cancelling it permanently stops reconnection (without disconnecting
+// an established session — use [Lifecycle.Stop] for an orderly
+// shutdown). Pass a context that lives as long as reconnection should,
+// typically the application's run context — never a short-lived
+// timeout context, or the loop silently dies with it.
 func (l *Lifecycle) Start(ctx context.Context) error {
 	l.mu.Lock()
 	if l.started {
@@ -136,11 +154,27 @@ func (l *Lifecycle) Stop(ctx context.Context) error {
 }
 
 func (l *Lifecycle) loop(ctx context.Context) {
+	// Type-assert the connector's optional event-driven capability once.
+	// A nil channel is fine: a receive on it blocks forever, so a
+	// connector that does not implement [ConnectionNotifier] falls back
+	// to pure timer polling with no extra branching.
+	var lost <-chan struct{}
+	if n, ok := l.connector.(ConnectionNotifier); ok {
+		lost = n.ConnectionLost()
+	}
+
 	backoff := l.cfg.InitialBackoff
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-lost:
+			// The adapter detected the socket dropped. Reconnect
+			// promptly instead of waiting out the timer — which, after
+			// an idle probe, may be a full MaxBackoff away — and reset
+			// the backoff to InitialBackoff so a link that just blipped
+			// re-establishes fast rather than at MaxBackoff.
+			backoff = l.cfg.InitialBackoff
 		case <-time.After(l.jittered(backoff)):
 		}
 		if err := l.connectOnce(ctx); err != nil {
@@ -150,8 +184,8 @@ func (l *Lifecycle) loop(ctx context.Context) {
 			// warn-level noise and keep the backoff at MaxBackoff
 			// so the next idle probe is far in the future. Only
 			// real failures (dial / connack) should drive the
-			// exponential growth — those carry a different message.
-			if isAlreadyConnectedErr(err) {
+			// exponential growth — those carry a different error.
+			if errors.Is(err, ErrAlreadyConnected) {
 				backoff = l.cfg.MaxBackoff
 				continue
 			}
@@ -164,14 +198,6 @@ func (l *Lifecycle) loop(ctx context.Context) {
 		}
 		backoff = l.cfg.InitialBackoff
 	}
-}
-
-// isAlreadyConnectedErr reports whether err is the connector's
-// "still connected" signal. Matches by suffix to stay robust against
-// future error-wrapping; the actual error originates in
-// [TCPClient.Connect] and bubbles up through [Lifecycle.connectOnce].
-func isAlreadyConnectedErr(err error) bool {
-	return err != nil && strings.HasSuffix(err.Error(), "already connected")
 }
 
 func (l *Lifecycle) connectOnce(ctx context.Context) error {

@@ -3,700 +3,320 @@
 
 package mqtt
 
+// Mock-broker-based Lifecycle tests: a real TCPClient wrapped in a
+// Lifecycle, driven against mockBroker. lifecycle_unit_test.go covers the
+// backoff/notifier state machine in isolation against stub Connectors;
+// this file proves the same Lifecycle wiring holds end to end against the
+// adapter's actual ConnectionNotifier/Connector behavior — event-driven
+// reconnect after a dropped socket, the PINGRESP watchdog, CONNACK
+// rejection, Stop/Start state, and resubscribe replay — all through
+// Lifecycle.Start/Stop rather than calling TCPClient.Connect by hand
+// (adapter_integration_test.go's mustConnect). Shared helpers
+// (newIntegrationConfig, lcPoll) live in adapter_integration_test.go and
+// lifecycle_unit_test.go, already package-visible.
+
 import (
 	"context"
 	"errors"
-	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/SukramJ/go-mqtt/protocol"
 )
 
-// ---------------------------------------------------------------------------
-// MQTT lifecycle integration tests — use lifecycleMockBroker (TCP-based)
-// ---------------------------------------------------------------------------
+// TestLifecycleReconnectsPromptlyAfterTCPReset proves a Lifecycle wrapping a
+// live TCPClient reconnects via the ConnectionLost notifier, not the timer
+// fallback: InitialBackoff is set far larger than any plausible localhost
+// reconnect, so a fast reconnect can only be explained by the event-driven
+// path.
+func TestLifecycleReconnectsPromptlyAfterTCPReset(t *testing.T) {
+	t.Parallel()
 
-// fastLifecycleCfg returns a LifecycleConfig with very short backoff
-// timings so tests do not need to wait wall-clock seconds.
-func fastLifecycleCfg() LifecycleConfig {
-	return LifecycleConfig{
-		InitialBackoff: 20 * time.Millisecond,
-		MaxBackoff:     100 * time.Millisecond,
-		Jitter:         0, // no jitter: deterministic timing in tests
-	}
-}
+	b := newMockBroker(t)
+	c := NewTCPClient(newIntegrationConfig(b.URL(), "lc-reset"))
+	lc := NewLifecycle(LifecycleConfig{InitialBackoff: 3 * time.Second, MaxBackoff: 3 * time.Second}, c)
 
-// waitCondition polls fn up to timeout, sleeping 5 ms between attempts.
-// Returns true if fn returned true before the deadline.
-func waitCondition(timeout time.Duration, fn func() bool) bool {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if fn() {
-			return true
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	return false
-}
-
-// TestMQTTReconnectAfterTCPReset verifies that after InjectTCPReset the
-// client detects the broken socket (c.conn is cleared by
-// handleConnectionLost) and re-dials the broker.
-func TestMQTTReconnectAfterTCPReset(t *testing.T) {
-	broker := newLifecycleMockBroker(t)
-
-	client := NewTCPClient(TCPConfig{
-		BrokerURL: broker.URL(),
-		ClientID:  "lc-reset-test",
-		KeepAlive: 30 * time.Second,
-	})
-
-	cfg := fastLifecycleCfg()
-	lc := NewLifecycle(cfg, client)
-
-	runCtx, cancelRun := context.WithCancel(context.Background())
-	defer cancelRun()
-
-	if err := lc.Start(runCtx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	// Use a short stop deadline so the post-reset keepAlive goroutine
-	// (which is waiting on its next ticker tick, up to 15 s away) does
-	// not block the test suite for the full keepAlive/2 period.
-	// Disconnect selects on ctx.Done, so a 500 ms deadline here causes
-	// it to return quickly while the goroutine drains in the background.
-	t.Cleanup(func() {
-		cancelRun()
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-		defer stopCancel()
-		_ = lc.Stop(stopCtx)
-	})
-
-	// Confirm initial connection.
-	if !waitCondition(2*time.Second, func() bool { return broker.ConnCount() >= 1 }) {
-		t.Fatal("broker never saw initial connection")
-	}
-
-	// TCP RST — broker closes the socket abruptly.
-	broker.InjectTCPReset()
-
-	// After the read-loop detects EOF, handleConnectionLost clears c.conn.
-	// The lifecycle loop then re-dials; expect a second connection.
-	if !waitCondition(3*time.Second, func() bool { return broker.ConnCount() >= 2 }) {
-		t.Fatalf("broker never saw reconnect; conn count = %d", broker.ConnCount())
-	}
-}
-
-// TestMQTTReconnectAfterPingTimeout verifies the PINGRESP watchdog: when
-// the broker goes silent on a half-open socket (accepts the TCP write of
-// the PINGREQ but never answers and never sends FIN/RST), the read-loop
-// stays blocked in ReadFrame and would otherwise never detect the dead
-// connection. The keep-alive loop must notice the unanswered PINGREQ and
-// declare the connection lost so the lifecycle reconnects.
-func TestMQTTReconnectAfterPingTimeout(t *testing.T) {
-	broker := newLifecycleMockBroker(t)
-
-	client := NewTCPClient(TCPConfig{
-		BrokerURL: broker.URL(),
-		ClientID:  "lc-ping-timeout-test",
-		KeepAlive: 30 * time.Second, // sent in CONNECT; watchdog uses pingInterval below
-	})
-	// Shrink the ping interval so the watchdog fires in tens of ms rather
-	// than the spec-floored 15s (KeepAlive/2). Set before Start so the
-	// first keepAliveLoop picks it up.
-	client.pingInterval = 40 * time.Millisecond
-
-	cfg := fastLifecycleCfg()
-	lc := NewLifecycle(cfg, client)
-
-	runCtx, cancelRun := context.WithCancel(context.Background())
-	defer cancelRun()
-
-	if err := lc.Start(runCtx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	t.Cleanup(func() {
-		cancelRun()
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-		defer stopCancel()
-		_ = lc.Stop(stopCtx)
-	})
-
-	// Confirm initial connection.
-	if !waitCondition(2*time.Second, func() bool { return broker.ConnCount() >= 1 }) {
-		t.Fatal("broker never saw initial connection")
-	}
-
-	// Half-open: broker keeps the socket open but stops answering PINGs.
-	broker.DropPings(true)
-
-	// The watchdog trips on the tick after the unanswered PINGREQ, calls
-	// handleConnectionLost, and the lifecycle re-dials.
-	if !waitCondition(3*time.Second, func() bool { return broker.ConnCount() >= 2 }) {
-		t.Fatalf("watchdog never tripped; conn count = %d", broker.ConnCount())
-	}
-
-	// Recovery: once the broker answers PINGs again, the reconnected
-	// session stays up instead of being torn down every interval.
-	broker.DropPings(false)
-	if !waitCondition(2*time.Second, func() bool { return client.IsConnected() }) {
-		t.Fatal("client did not settle into a healthy connection after recovery")
-	}
-}
-
-// TestPingWatchdogToleratesSingleMissedPong verifies the watchdog does
-// NOT tear the connection down on a single unanswered PINGREQ: only after
-// pingTimeoutThreshold consecutive misses is the socket declared dead. A
-// lone dropped PINGRESP — a GC pause, a scheduler stall on a throttled
-// host, a momentary network blip — must be ridden out without a spurious
-// reconnect. Counterpart to TestMQTTReconnectAfterPingTimeout, which pins
-// that a *persistently* silent broker is still detected.
-func TestPingWatchdogToleratesSingleMissedPong(t *testing.T) {
-	broker := newLifecycleMockBroker(t)
-
-	client := NewTCPClient(TCPConfig{
-		BrokerURL: broker.URL(),
-		ClientID:  "lc-ping-tolerate-test",
-		KeepAlive: 30 * time.Second,
-	})
-	// Fast ticks so several ping cycles elapse within the test window.
-	client.pingInterval = 40 * time.Millisecond
-
-	lc := NewLifecycle(fastLifecycleCfg(), client)
-
-	runCtx, cancelRun := context.WithCancel(context.Background())
-	defer cancelRun()
-
-	if err := lc.Start(runCtx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	t.Cleanup(func() {
-		cancelRun()
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-		defer stopCancel()
-		_ = lc.Stop(stopCtx)
-	})
-
-	if !waitCondition(2*time.Second, func() bool { return broker.ConnCount() >= 1 }) {
-		t.Fatal("broker never saw initial connection")
-	}
-
-	// Drop exactly one PINGREQ, then answer normally again.
-	broker.DropNextPings(1)
-
-	// Across several ping intervals the single miss must NOT force a
-	// reconnect: the connection count stays at 1 and the client stays up.
-	time.Sleep(300 * time.Millisecond) // ~7 ticks at 40ms
-	if got := broker.ConnCount(); got != 1 {
-		t.Fatalf("single missed pong forced a reconnect: conn count = %d, want 1", got)
-	}
-	if !client.IsConnected() {
-		t.Fatal("client dropped its connection after a single missed pong")
-	}
-}
-
-// TestMQTTConnackFailureBackoff verifies that a non-zero CONNACK return
-// code causes the lifecycle to back off and does NOT spam connect
-// attempts faster than InitialBackoff.
-func TestMQTTConnackFailureBackoff(t *testing.T) {
-	broker := newLifecycleMockBroker(t)
-
-	client := NewTCPClient(TCPConfig{
-		BrokerURL:   broker.URL(),
-		ClientID:    "lc-backoff-test",
-		KeepAlive:   30 * time.Second,
-		DialTimeout: 500 * time.Millisecond,
-	})
-
-	cfg := LifecycleConfig{
-		InitialBackoff: 80 * time.Millisecond,
-		MaxBackoff:     200 * time.Millisecond,
-		Jitter:         0,
-	}
-	lc := NewLifecycle(cfg, client)
-
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-
-	// Reject ALL connects by pre-setting before Start and re-arming
-	// inside a goroutine so the loop always sees a rejection.
-	broker.RejectNextConnect()
-
-	// Start will fail on the first (synchronous) connect attempt.
-	err := lc.Start(ctx)
-	if err == nil {
-		// If Start did succeed somehow, stop cleanly.
-		_ = lc.Stop(ctx)
-		t.Fatal("expected Start to fail when broker rejects CONNACK")
-	}
-
-	// Measure how many TCP connections the broker has seen over 400 ms
-	// with an 80 ms InitialBackoff. Even in the worst case (no backoff
-	// at all) the theoretical maximum is 400/0 = ∞; with the correct
-	// backoff it is at most ~5. We verify it is well under 20 to rule
-	// out a runaway reconnect storm.
-	//
-	// The lifecycle does NOT start a background loop on a failed first
-	// connect, so broker.ConnCount() stays at 1 (the one attempt from
-	// Start). The test confirms that exactly 1 connection was made and
-	// the lifecycle did not spin.
-	time.Sleep(400 * time.Millisecond)
-	count := broker.ConnCount()
-	if count > 3 {
-		t.Fatalf("reconnect spam: broker saw %d connections in 400 ms (want ≤ 3)", count)
-	}
-}
-
-// TestMQTTForceDisconnectClearsConn verifies that calling
-// lifecycle.Stop causes the underlying TCPClient's c.conn to be nil
-// so a subsequent Connect call dials a fresh socket instead of
-// returning "already connected".
-func TestMQTTForceDisconnectClearsConn(t *testing.T) {
-	broker := newLifecycleMockBroker(t)
-
-	client := NewTCPClient(TCPConfig{
-		BrokerURL: broker.URL(),
-		ClientID:  "lc-force-dc-test",
-		KeepAlive: 30 * time.Second,
-	})
-
-	cfg := fastLifecycleCfg()
-	lc := NewLifecycle(cfg, client)
-
-	ctx := context.Background()
 	if err := lc.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-
-	// Graceful stop via lifecycle.
-	if err := lc.Stop(ctx); err != nil {
-		t.Fatalf("Stop: %v", err)
+	t.Cleanup(func() { _ = lc.Stop(context.Background()) })
+	if got := b.ConnCount(); got != 1 {
+		t.Fatalf("ConnCount after Start = %d, want 1", got)
 	}
 
-	// After Stop, c.conn must be nil; a new Connect should succeed
-	// without "already connected".
-	if err := client.Connect(ctx); err != nil {
-		t.Fatalf("Connect after Stop: %v (want nil — c.conn was not cleared)", err)
+	start := time.Now()
+	b.InjectTCPReset()
+	if !lcPoll(2*time.Second, func() bool { return b.ConnCount() >= 2 }) {
+		t.Fatal("lifecycle never reconnected after InjectTCPReset")
 	}
-	defer client.Disconnect(ctx) //nolint:errcheck // test cleanup: disconnect error is not actionable
-
-	if broker.ConnCount() < 2 {
-		t.Fatalf("expected at least 2 broker connections; got %d", broker.ConnCount())
+	if elapsed := time.Since(start); elapsed > 1500*time.Millisecond {
+		t.Fatalf("reconnect took %v — did not clearly beat the 3s backoff timer "+
+			"(event-driven notifier path may not have fired)", elapsed)
 	}
 }
 
-// TestMQTTSubscribeReplayAfterReconnect verifies that all topic filters
-// registered via Subscribe are re-sent to the broker on reconnect.
-func TestMQTTSubscribeReplayAfterReconnect(t *testing.T) {
-	broker := newLifecycleMockBroker(t)
-
-	client := NewTCPClient(TCPConfig{
-		BrokerURL: broker.URL(),
-		ClientID:  "lc-sub-replay-test",
-		KeepAlive: 30 * time.Second,
-	})
-
-	cfg := fastLifecycleCfg()
-	lc := NewLifecycle(cfg, client)
-
-	// Use a separate runCtx for the lifecycle and a separate stopCtx
-	// for teardown so that cancelling the run loop does not short-
-	// circuit Disconnect's wg.Wait (which selects on ctx.Done).
-	runCtx, cancelRun := context.WithCancel(context.Background())
-	defer cancelRun()
-
-	if err := lc.Start(runCtx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	// Short stop deadline (same reason as TestMQTTReconnectAfterTCPReset).
-	t.Cleanup(func() {
-		cancelRun()
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-		defer stopCancel()
-		_ = lc.Stop(stopCtx)
-	})
-
-	// Subscribe to 5 distinct topic filters.
-	topics := []string{
-		"gh/ccu1/device/+/state",
-		"gh/ccu1/device/+/set",
-		"gh/ccu1/hub/status",
-		"gh/ccu1/command/#",
-		"homeassistant/status",
-	}
-	for _, f := range topics {
-		if err := client.Subscribe(runCtx, f, QoS1, func(string, []byte, bool) {}); err != nil {
-			t.Fatalf("Subscribe(%q): %v", f, err)
-		}
-	}
-
-	// Wait until broker has seen the 5 initial SUBSCRIBE frames.
-	if !waitCondition(2*time.Second, func() bool { return broker.SubscribeCount() >= 5 }) {
-		t.Fatalf("broker never saw 5 initial subscribes; got %d", broker.SubscribeCount())
-	}
-
-	initialSubs := broker.SubscribeCount()
-
-	// TCP RST — triggers reconnect + subscribe replay.
-	broker.InjectTCPReset()
-
-	// After reconnect, Connect replays all 5 filters; broker total rises
-	// by 5.
-	if !waitCondition(3*time.Second, func() bool {
-		return broker.SubscribeCount() >= initialSubs+5
-	}) {
-		t.Fatalf(
-			"subscribe replay incomplete: broker total = %d, want ≥ %d",
-			broker.SubscribeCount(), initialSubs+5,
-		)
-	}
-}
-
-type stubConnector struct {
-	connects    atomic.Int32
-	disconnects atomic.Int32
-	err         atomic.Value
-}
-
-func (s *stubConnector) Connect(_ context.Context) error {
-	s.connects.Add(1)
-	if e := s.err.Load(); e != nil {
-		if err, ok := e.(error); ok {
-			return err
-		}
-	}
-	return nil
-}
-
-func (s *stubConnector) Disconnect(_ context.Context) error {
-	s.disconnects.Add(1)
-	return nil
-}
-
-func TestLifecycleStartFiresOnConnect(t *testing.T) {
-	s := &stubConnector{}
-	l := NewLifecycle(DefaultLifecycle(), s)
-	var callbacks int
-	l.OnConnect(func(context.Context) { callbacks++ })
-	if err := l.Start(context.Background()); err != nil {
-		t.Fatalf("start: %v", err)
-	}
-	defer func() { _ = l.Stop(context.Background()) }()
-	if s.connects.Load() != 1 || callbacks != 1 {
-		t.Fatalf("connects=%d cb=%d", s.connects.Load(), callbacks)
-	}
-}
-
-func TestLifecycleFirstConnectErrorBubbles(t *testing.T) {
-	s := &stubConnector{}
-	s.err.Store(errors.New("boom"))
-	l := NewLifecycle(DefaultLifecycle(), s)
-	if err := l.Start(context.Background()); err == nil {
-		t.Fatal("expected error")
-	}
-}
-
-func TestLifecycleStopCallsDisconnect(t *testing.T) {
-	s := &stubConnector{}
-	l := NewLifecycle(DefaultLifecycle(), s)
-	_ = l.Start(context.Background())
-	if err := l.Stop(context.Background()); err != nil {
-		t.Fatalf("stop: %v", err)
-	}
-	if s.disconnects.Load() != 1 {
-		t.Fatalf("disconnects=%d", s.disconnects.Load())
-	}
-}
-
-// NOTE: TestWiringDriftDetection, TestNoopClientRecordsPublications and
-// TestNoopClientSubscribeDelivery from the upstream openccu-loom tests
-// were dropped during the port — they exercise Bridge / NoopClient /
-// Wiring helpers that live in the upstream business-logic layer, not
-// in the pure-transport package we lifted.
-
-func TestLifecycleJitterBounded(t *testing.T) {
-	cfg := DefaultLifecycle()
-	cfg.Jitter = 10 * time.Millisecond
-	l := NewLifecycle(cfg, &stubConnector{})
-	for range 50 {
-		got := l.jittered(100 * time.Millisecond)
-		if got < 90*time.Millisecond || got > 110*time.Millisecond {
-			t.Fatalf("jittered=%v", got)
-		}
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Lifecycle-Recovery tests
-// ---------------------------------------------------------------------------
-
-// TestForcedDisconnectKeepsSubscriptions verifies that after a TCP reset all
-// previously registered subscriptions are replayed on the new socket. The
-// mock broker counts SUBSCRIBE frames across all connections; after reconnect
-// the total must have risen by the number of registered filters.
-func TestForcedDisconnectKeepsSubscriptions(t *testing.T) {
+// TestLifecyclePingWatchdogReconnectsAndRecovers proves persistent PINGRESP
+// silence trips the watchdog (torn down as a lost connection, so the
+// Lifecycle reconnects), and that once pings are answered again the client
+// settles into a stable connected state rather than looping forever —
+// DropPings is sticky across reconnects, so a fresh link would otherwise
+// keep re-tripping the same watchdog.
+func TestLifecyclePingWatchdogReconnectsAndRecovers(t *testing.T) {
 	t.Parallel()
 
-	broker := newLifecycleMockBroker(t)
+	b := newMockBroker(t)
+	c := NewTCPClient(newIntegrationConfig(b.URL(), "lc-watchdog"))
+	// Package-test-only override (see adapter_tcp.go's pingInterval field
+	// doc) so the watchdog trips well within the test budget instead of
+	// waiting out the 30s keep-alive floor.
+	c.pingInterval = 30 * time.Millisecond
+	lc := NewLifecycle(LifecycleConfig{InitialBackoff: 2 * time.Second, MaxBackoff: 2 * time.Second}, c)
 
-	client := NewTCPClient(TCPConfig{
-		BrokerURL: broker.URL(),
-		ClientID:  "lc-forced-subs-test",
-		KeepAlive: 30 * time.Second,
-	})
-
-	cfg := fastLifecycleCfg()
-	lc := NewLifecycle(cfg, client)
-
-	// OnConnect callback registers subscriptions after each reconnect
-	// (same as the bridge wiring code does).
-	filters := []string{
-		"gh/ccu1/device/+/state",
-		"gh/ccu1/device/+/set",
-		"gh/ccu1/command/#",
-	}
-
-	runCtx, cancelRun := context.WithCancel(context.Background())
-	defer cancelRun()
-
-	if err := lc.Start(runCtx); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := lc.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
-	t.Cleanup(func() {
-		cancelRun()
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-		defer stopCancel()
-		_ = lc.Stop(stopCtx)
-	})
+	t.Cleanup(func() { _ = lc.Stop(context.Background()) })
 
-	// Register subscriptions on the first connection.
-	for _, f := range filters {
-		if err := client.Subscribe(runCtx, f, QoS1, func(string, []byte, bool) {}); err != nil {
-			t.Fatalf("Subscribe(%q): %v", f, err)
-		}
+	b.DropPings(true)
+	if !lcPoll(2*time.Second, func() bool { return b.ConnCount() >= 2 }) {
+		t.Fatal("watchdog never tripped a reconnect under persistent PINGRESP silence")
 	}
 
-	// Wait until the broker has seen all initial SUBSCRIBE frames.
-	if !waitCondition(2*time.Second, func() bool {
-		return broker.SubscribeCount() >= len(filters)
-	}) {
-		t.Fatalf("broker never saw initial subscribes; got %d", broker.SubscribeCount())
+	b.DropPings(false)
+	if !lcPoll(2*time.Second, func() bool { return c.IsConnected() }) {
+		t.Fatal("client never recovered a stable connection once pings resumed")
 	}
-
-	baseSubs := broker.SubscribeCount()
-
-	// Inject a TCP reset — after reconnect all filters must be
-	// re-subscribed (ReSubscribe-Replay in TCPClient.Connect).
-	broker.InjectTCPReset()
-
-	// Broker must have seen at least a second connect.
-	if !waitCondition(3*time.Second, func() bool { return broker.ConnCount() >= 2 }) {
-		t.Fatalf("no reconnect after TCP reset; connCount=%d", broker.ConnCount())
-	}
-
-	// Broker must have received the subscriptions again.
-	if !waitCondition(3*time.Second, func() bool {
-		return broker.SubscribeCount() >= baseSubs+len(filters)
-	}) {
-		t.Fatalf(
-			"subscribe replay incomplete: broker total=%d, want≥%d",
-			broker.SubscribeCount(), baseSubs+len(filters),
-		)
-	}
-}
-
-// TestSubscribeReplayPreservesQoS verifies that a filter subscribed at a
-// non-default QoS is replayed on reconnect at that same QoS, not silently
-// forced to a fixed level. Subscribes at QoS0, forces a TCP reset, and
-// asserts every SUBSCRIBE the broker saw — initial and replayed — carried
-// QoS0.
-func TestSubscribeReplayPreservesQoS(t *testing.T) {
-	t.Parallel()
-
-	broker := newLifecycleMockBroker(t)
-
-	client := NewTCPClient(TCPConfig{
-		BrokerURL: broker.URL(),
-		ClientID:  "lc-qos-replay-test",
-		KeepAlive: 30 * time.Second,
-	})
-
-	lc := NewLifecycle(fastLifecycleCfg(), client)
-
-	runCtx, cancelRun := context.WithCancel(context.Background())
-	defer cancelRun()
-
-	if err := lc.Start(runCtx); err != nil {
-		t.Fatalf("Start: %v", err)
-	}
-	t.Cleanup(func() {
-		cancelRun()
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-		defer stopCancel()
-		_ = lc.Stop(stopCtx)
-	})
-
-	// QoS0 is the non-default level; a hardcoded QoS1 replay would show
-	// up here as a mismatch.
-	if err := client.Subscribe(runCtx, "gh/ccu1/state", QoS0, func(string, []byte, bool) {}); err != nil {
-		t.Fatalf("Subscribe: %v", err)
-	}
-	if !waitCondition(2*time.Second, func() bool { return broker.SubscribeCount() >= 1 }) {
-		t.Fatalf("broker never saw initial subscribe")
-	}
-	initial := broker.SubscribeCount()
-
-	broker.InjectTCPReset()
-
-	if !waitCondition(3*time.Second, func() bool { return broker.SubscribeCount() > initial }) {
-		t.Fatalf("subscribe not replayed after reset; got %d", broker.SubscribeCount())
-	}
-
-	for i, q := range broker.SubscribeQoS() {
-		if q != byte(QoS0) {
-			t.Fatalf("SUBSCRIBE #%d used QoS %d, want 0 (replay must preserve the requested QoS)", i, q)
+	settled := b.ConnCount()
+	for range 10 {
+		time.Sleep(20 * time.Millisecond)
+		if b.ConnCount() != settled || !c.IsConnected() {
+			t.Fatalf("connection unstable after recovery: ConnCount %d -> %d, IsConnected=%v",
+				settled, b.ConnCount(), c.IsConnected())
 		}
 	}
 }
 
-// TestConnackFailureBackoffMaxBackoff verifies that the lifecycle loop backs
-// off to MaxBackoff under repeated CONNACK failures and does not spin
-// uncontrolled connection attempts.
-//
-// Strategy: broker rejects all connects. The number of connection attempts
-// is measured over a fixed window and verified to be well below the
-// theoretical maximum without any backoff.
-func TestConnackFailureBackoffMaxBackoff(t *testing.T) {
+// TestLifecyclePingWatchdogToleratesSingleDroppedPing proves the
+// pingTimeoutThreshold=2 tolerance: a single dropped PINGRESP must be
+// ridden out without tearing the connection down.
+func TestLifecyclePingWatchdogToleratesSingleDroppedPing(t *testing.T) {
 	t.Parallel()
 
-	broker := newLifecycleMockBroker(t)
+	b := newMockBroker(t)
+	c := NewTCPClient(newIntegrationConfig(b.URL(), "lc-watchdog-tolerant"))
+	c.pingInterval = 30 * time.Millisecond
+	lc := NewLifecycle(LifecycleConfig{InitialBackoff: 2 * time.Second, MaxBackoff: 2 * time.Second}, c)
 
-	// First reject for the synchronous Start attempt.
-	broker.RejectNextConnect()
-
-	client := NewTCPClient(TCPConfig{
-		BrokerURL:   broker.URL(),
-		ClientID:    "lc-backoff-max-test",
-		KeepAlive:   30 * time.Second,
-		DialTimeout: 200 * time.Millisecond,
-	})
-
-	cfg := LifecycleConfig{
-		InitialBackoff: 50 * time.Millisecond,
-		MaxBackoff:     150 * time.Millisecond,
-		Jitter:         0, // deterministic
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := lc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
 	}
-	lc := NewLifecycle(cfg, client)
+	t.Cleanup(func() { _ = lc.Stop(context.Background()) })
 
-	ctx, cancel := context.WithCancel(context.Background())
+	b.DropNextPings(1)
+
+	// Give it several ping intervals' worth of headroom (proving a
+	// negative requires waiting out a window, not polling for an event),
+	// then confirm no reconnect happened.
+	time.Sleep(300 * time.Millisecond)
+	if got := b.ConnCount(); got != 1 {
+		t.Fatalf("ConnCount = %d, want 1 (a single dropped ping must not trigger a reconnect)", got)
+	}
+	if !c.IsConnected() {
+		t.Fatal("IsConnected = false after tolerating a single dropped ping")
+	}
+}
+
+// TestLifecycleServerKeepAliveOverridesPingCadenceAndWatchdogStillTrips
+// proves the CONNACK Server Keep Alive property reschedules the ping
+// cadence (spec MUST) rather than the client sticking to its requested
+// KeepAlive, and that the watchdog still trips on persistent silence at
+// that negotiated cadence.
+func TestLifecycleServerKeepAliveOverridesPingCadenceAndWatchdogStillTrips(t *testing.T) {
+	t.Parallel()
+
+	b := newMockBroker(t)
+	ka := uint16(1) // seconds; smallest meaningful non-zero Server Keep Alive
+	b.SetConnackProperties(&protocol.Properties{ServerKeepAlive: &ka})
+
+	c := NewTCPClient(newIntegrationConfig(b.URL(), "lc-ska")) // no pingInterval override
+	lc := NewLifecycle(LifecycleConfig{InitialBackoff: 2 * time.Second, MaxBackoff: 2 * time.Second}, c)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	if err := lc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = lc.Stop(context.Background()) })
+
+	res, ok := c.ConnectResult()
+	if !ok || res.ServerKeepAlive != time.Second {
+		t.Fatalf("ConnectResult.ServerKeepAlive = %v, ok=%v, want 1s", res.ServerKeepAlive, ok)
+	}
+
+	// Effective cadence is ServerKeepAlive/2 = 500ms. Coarse assert: at
+	// least 2 pings land within 1.3s, and it does not run away far past
+	// that cadence — wide enough to absorb scheduler jitter without being
+	// meaningless.
+	if !lcPoll(1300*time.Millisecond, func() bool { return b.PingCount() >= 2 }) {
+		t.Fatalf("PingCount = %d after 1.3s, want >= 2 at the 500ms overridden cadence", b.PingCount())
+	}
+	if got := b.PingCount(); got > 6 {
+		t.Fatalf("PingCount = %d, cadence looks far faster than the 500ms override", got)
+	}
+
+	b.DropPings(true)
+	if !lcPoll(2*time.Second, func() bool { return b.ConnCount() >= 2 }) {
+		t.Fatal("watchdog never tripped a reconnect at the ServerKeepAlive-derived cadence")
+	}
+}
+
+// TestLifecycleConnackRejectionFailsStartWithoutReconnectStorm proves a
+// rejected CONNACK — both a direct MQTT 5.0 reason code and an MQTT 3.1.1
+// return code mapped onto its v5 equivalent — fails Lifecycle.Start
+// synchronously with a *ReasonError, and that the failure path never spins
+// up the background reconnect loop (so no storm of reconnect attempts
+// follows).
+func TestLifecycleConnackRejectionFailsStartWithoutReconnectStorm(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		version    ProtocolVersion
+		rejectByte byte
+	}{
+		{"v5 direct reason code", ProtocolV50, byte(protocol.ClientIdentifierNotValid)},
+		{"v3 return code mapped to v5 reason", ProtocolV311, 0x02}, // -> ClientIdentifierNotValid
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			b := newMockBroker(t)
+			b.RejectNextConnect(tc.rejectByte)
+
+			cfg := newIntegrationConfig(b.URL(), "lc-reject")
+			cfg.ProtocolVersion = tc.version
+			c := NewTCPClient(cfg)
+			lc := NewLifecycle(LifecycleConfig{InitialBackoff: 50 * time.Millisecond, MaxBackoff: 50 * time.Millisecond}, c)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			err := lc.Start(ctx)
+			var re *ReasonError
+			if !errors.As(err, &re) {
+				t.Fatalf("Start error = %v, want *ReasonError", err)
+			}
+			if re.Code != protocol.ClientIdentifierNotValid {
+				t.Fatalf("reason code = %v, want ClientIdentifierNotValid", re.Code)
+			}
+
+			// A failed first connect must not leave the loop running: give
+			// it several would-be backoff intervals, then confirm the
+			// attempt count never grew past the single rejected CONNECT.
+			time.Sleep(200 * time.Millisecond)
+			if got := b.ConnCount(); got != 1 {
+				t.Fatalf("ConnCount = %d after a failed Start, want 1 (no reconnect storm)", got)
+			}
+		})
+	}
+}
+
+// TestLifecycleStopClearsStateAndAllowsFreshRestart proves Stop tears the
+// session down and clears the started flag, a concurrent double Start is
+// rejected, and Start after Stop dials a genuinely fresh connection (not a
+// bounce off ErrAlreadyConnected — the link was actually closed, not just
+// the lifecycle's own bookkeeping).
+func TestLifecycleStopClearsStateAndAllowsFreshRestart(t *testing.T) {
+	t.Parallel()
+
+	b := newMockBroker(t)
+	c := NewTCPClient(newIntegrationConfig(b.URL(), "lc-stop-restart"))
+	lc := NewLifecycle(DefaultLifecycle(), c)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	// Start fails on the first (synchronous) attempt.
+	if err := lc.Start(ctx); err != nil {
+		t.Fatalf("first Start: %v", err)
+	}
+	if got := b.ConnCount(); got != 1 {
+		t.Fatalf("ConnCount after first Start = %d, want 1", got)
+	}
+
 	if err := lc.Start(ctx); err == nil {
-		_ = lc.Stop(ctx)
-		t.Fatal("Start should have failed on CONNACK rejection")
+		t.Fatal("concurrent double Start returned nil, want an error")
 	}
 
-	// After a failed Start the lifecycle loop does NOT start —
-	// ConnCount stays at 1. Verify no reconnect storm over 300 ms
-	// (max 3 attempts).
-	time.Sleep(300 * time.Millisecond)
-	count := broker.ConnCount()
-	if count > 3 {
-		t.Fatalf("reconnect storm: broker saw %d connections in 300 ms (want≤3)", count)
+	if err := lc.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if c.IsConnected() {
+		t.Fatal("IsConnected = true after Stop")
 	}
 
-	// Second part: lifecycle running, broker rejects several times then
-	// allows. Count connections within the time window.
-	//
-	// Fresh client + lifecycle for the background-loop test.
-	broker2 := newLifecycleMockBroker(t)
-	client2 := NewTCPClient(TCPConfig{
-		BrokerURL:   broker2.URL(),
-		ClientID:    "lc-backoff-max-loop-test",
-		KeepAlive:   30 * time.Second,
-		DialTimeout: 200 * time.Millisecond,
-	})
-	lc2 := NewLifecycle(cfg, client2)
-
-	ctx2, cancel2 := context.WithCancel(context.Background())
-	defer cancel2()
-
-	// Allow the first successful connect, then start the backoff loop.
-	if err := lc2.Start(ctx2); err != nil {
-		t.Fatalf("lc2.Start: %v", err)
+	if err := lc.Start(ctx); err != nil {
+		t.Fatalf("Start after Stop: %v (want a fresh dial, not ErrAlreadyConnected)", err)
 	}
-	t.Cleanup(func() {
-		cancel2()
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-		defer stopCancel()
-		_ = lc2.Stop(stopCtx)
-	})
-
-	// TCP reset + reject all reconnects for 3 cycles.
-	broker2.RejectNextConnect()
-	broker2.RejectNextConnect()
-	broker2.RejectNextConnect()
-	broker2.InjectTCPReset()
-
-	// Measure: in 600 ms (≈ 4× MaxBackoff) the broker must not see
-	// an uncontrolled flood. With MaxBackoff=150 ms at most ~4 attempts
-	// are possible; allow 10 generously.
-	connsBefore := broker2.ConnCount()
-	time.Sleep(600 * time.Millisecond)
-	connsAfter := broker2.ConnCount()
-	delta := connsAfter - connsBefore
-	if delta > 10 {
-		t.Fatalf("backoff exceeded: %d reconnects in 600 ms (want≤10)", delta)
+	t.Cleanup(func() { _ = lc.Stop(context.Background()) })
+	if got := b.ConnCount(); got != 2 {
+		t.Fatalf("ConnCount after restart = %d, want 2 (fresh dial)", got)
 	}
 }
 
-// TestTCPResetClearsConnDuringReadLoop is the focused unit test for the
-// bug class: after a TCP reset c.conn must not remain set, otherwise the
-// next Connect call returns "already connected".
-//
-// It uses a minimal in-process broker (lifecycleMockBroker), injects a TCP
-// reset, and verifies that a subsequent Connect call succeeds.
-func TestTCPResetClearsConnDuringReadLoop(t *testing.T) {
+// TestLifecycleResubscribeReplayPreservesQoSAndNoLocalAfterReset proves the
+// fire-and-log resubscribe replay lands after an event-driven Lifecycle
+// reconnect (no manual reconnect call in this test — unlike
+// adapter_integration_test.go's TestResubscribeReplayPreservesOptionsAndOrder,
+// which drives TCPClient.Connect by hand), preserving both the requested
+// QoS and an MQTT 5.0 subscription option (NoLocal).
+func TestLifecycleResubscribeReplayPreservesQoSAndNoLocalAfterReset(t *testing.T) {
 	t.Parallel()
 
-	broker := newLifecycleMockBroker(t)
+	b := newMockBroker(t)
+	c := NewTCPClient(newIntegrationConfig(b.URL(), "lc-resub"))
+	lc := NewLifecycle(LifecycleConfig{InitialBackoff: 20 * time.Millisecond, MaxBackoff: 20 * time.Millisecond}, c)
 
-	client := NewTCPClient(TCPConfig{
-		BrokerURL: broker.URL(),
-		ClientID:  "lc-tcpreset-conn-test",
-		KeepAlive: 30 * time.Second,
-	})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := lc.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = lc.Stop(context.Background()) })
 
-	ctx := context.Background()
-
-	// Establish the first connection.
-	if err := client.Connect(ctx); err != nil {
-		t.Fatalf("first Connect: %v", err)
+	if _, err := c.Subscribe(ctx, "lc/resub", QoS2, func(*Message) {}, WithNoLocal()); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+	if before := b.Subscriptions(); len(before) != 1 {
+		t.Fatalf("Subscriptions() before reset = %d, want 1", len(before))
 	}
 
-	// Confirm first successful connect.
-	if !waitCondition(2*time.Second, func() bool { return broker.ConnCount() >= 1 }) {
-		t.Fatal("broker never saw initial connection")
+	b.SetSessionPresent(false)
+	b.InjectTCPReset()
+
+	if !lcPoll(2*time.Second, func() bool { return len(b.Subscriptions()) >= 2 }) {
+		t.Fatalf("resubscribe replay never landed after an event-driven reconnect: %d frames",
+			len(b.Subscriptions()))
+	}
+	if !lcPoll(time.Second, func() bool { return c.IsConnected() }) {
+		t.Fatal("client never settled back into a connected state")
 	}
 
-	// Inject TCP reset — readLoop receives EOF and calls
-	// handleConnectionLost which sets c.conn → nil.
-	broker.InjectTCPReset()
-
-	// Wait until c.conn is cleared by handleConnectionLost.
-	// Indirect proof: a new Connect must now succeed (no "already connected").
-	if !waitCondition(2*time.Second, func() bool {
-		err := client.Connect(ctx)
-		if err == nil {
-			// Disconnect immediately to avoid a goroutine leak.
-			stopCtx, stopCancel := context.WithTimeout(ctx, 200*time.Millisecond)
-			defer stopCancel()
-			_ = client.Disconnect(stopCtx)
-			return true
-		}
-		// "already connected" means c.conn was not yet cleared.
-		return false
-	}) {
-		t.Fatal("c.conn was not cleared after TCP reset — handleConnectionLost did not nil c.conn")
+	replayed := b.Subscriptions()[1]
+	if replayed.Filter != "lc/resub" {
+		t.Fatalf("replayed filter = %q, want lc/resub", replayed.Filter)
+	}
+	if replayed.Options.QoS != byte(QoS2) {
+		t.Fatalf("replayed QoS = %d, want %d", replayed.Options.QoS, QoS2)
+	}
+	if !replayed.Options.NoLocal {
+		t.Fatal("replayed NoLocal option lost across the reconnect replay")
 	}
 }

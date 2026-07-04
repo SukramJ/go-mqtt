@@ -1,16 +1,13 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 OpenCCU-Loom authors.
 
-// Package mqtt provides the MQTT transport for the daemon: a TCP/TLS
-// adapter, publish/subscribe plumbing, and a reconnecting lifecycle
-// around an inverter-to-broker connection.
 package mqtt
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -23,147 +20,274 @@ import (
 	"github.com/SukramJ/go-mqtt/protocol"
 )
 
-// TCPConfig wires a [TCPClient] against a real broker.
+// Client-side defaults. All are overridable through [TCPConfig].
+const (
+	// defaultMaxPacketSize is the inbound frame cap (and advertised
+	// Maximum Packet Size) used when [TCPConfig.MaximumPacketSize] is zero.
+	defaultMaxPacketSize uint32 = 1 << 20 // 1 MiB
+	// keepAliveFloor is the minimum keep-alive the client will request
+	// (MQTT spec §3.1.2.10 permits any value; a very small one wastes
+	// bandwidth on a bridge). A broker-imposed Server Keep Alive may still
+	// drive the ping schedule below this floor.
+	keepAliveFloor = 30 * time.Second
+	// defaultDialTimeout bounds the TCP/TLS dial plus the CONNECT/CONNACK
+	// round-trip.
+	defaultDialTimeout = 10 * time.Second
+	// defaultAckTimeout bounds how long Publish/Subscribe wait for the
+	// broker acknowledgement before giving up.
+	defaultAckTimeout = 20 * time.Second
+	// defaultMaxInflight / defaultReceiveMaximum is the 16-bit ceiling the
+	// spec assigns when a Receive Maximum is absent (§3.1.2.11.3).
+	defaultReceiveMaximum = 65535
+)
+
+// TCPConfig wires a [TCPClient] against a real broker. The zero value is
+// not usable on its own — at least BrokerURL and ClientID must be set —
+// but every timing/limit field has a sane default applied by
+// [NewTCPClient].
 type TCPConfig struct {
-	BrokerURL    string // tcp://host:1883 or tls://host:8883
-	ClientID     string
-	Username     string
-	Password     string
-	KeepAlive    time.Duration // floor: 30s per SPEC §18.1
-	DialTimeout  time.Duration // default 10s
-	AckTimeout   time.Duration // PUBACK wait, default 20s
-	TLSConfig    *tls.Config
-	WillTopic    string
-	WillPayload  []byte
-	WillRetain   bool
-	CleanSession bool
-	Logger       *slog.Logger
+	// BrokerURL is the broker endpoint: tcp://host[:1883] or
+	// tls://host[:8883] (mqtt://, ssl://, mqtts:// are accepted aliases).
+	BrokerURL string
+	// ClientID is the MQTT client identifier. An empty identifier on an
+	// MQTT 5.0 link asks the broker to assign one (surfaced on
+	// [ConnectResult.AssignedClientID]).
+	ClientID string
+	// Username is the optional CONNECT user name.
+	Username string
+	// Password is the optional CONNECT password. On an MQTT 3.1.1 link a
+	// password without a username is rejected by the codec.
+	Password string
+
+	// ProtocolVersion selects the wire dialect. The zero value selects
+	// MQTT 5.0 ([ProtocolV50]).
+	ProtocolVersion ProtocolVersion
+	// CleanStart is the CONNECT Clean Start bit (MQTT 3.1.1 Clean Session).
+	// When true the broker discards any prior session and the client resets
+	// its own stored QoS>0 state.
+	CleanStart bool
+	// SessionExpirySeconds is the MQTT 5.0 Session Expiry Interval (0x11)
+	// requested in CONNECT. Zero requests a session that ends when the
+	// connection closes (treated as a clean start for local session state).
+	SessionExpirySeconds uint32
+	// ReceiveMaximum is the number of unacknowledged QoS>0 PUBLISHes the
+	// client will accept concurrently, advertised to the broker (MQTT 5.0
+	// 0x21). Zero advertises nothing (the 65535 default).
+	ReceiveMaximum uint16
+	// MaximumPacketSize is both the largest packet the client will accept
+	// (advertised in CONNECT, enforced by the read loop) and the read-frame
+	// cap. Zero selects 1 MiB.
+	MaximumPacketSize uint32
+	// TopicAliasMaximum is the highest inbound topic alias the client
+	// accepts, advertised to the broker (MQTT 5.0 0x22). Zero disables
+	// inbound topic aliasing.
+	TopicAliasMaximum uint16
+	// UserProperties are MQTT 5.0 User Property pairs (0x26) attached to the
+	// CONNECT.
+	UserProperties []UserProperty
+
+	// KeepAlive is the requested keep-alive interval; values below the 30s
+	// floor are raised to it. A broker Server Keep Alive overrides the ping
+	// schedule even below the floor.
+	KeepAlive time.Duration
+	// DialTimeout bounds the dial and CONNECT/CONNACK round-trip (default
+	// 10s).
+	DialTimeout time.Duration
+	// AckTimeout bounds each Publish/Subscribe acknowledgement wait (default
+	// 20s).
+	AckTimeout time.Duration
+	// MaxInflight caps concurrent in-flight outbound QoS>0 sends on an MQTT
+	// 3.1.1 link (which has no Receive Maximum). Zero selects 65535.
+	MaxInflight uint16
+
+	// TLSConfig is used for tls:// endpoints. When nil a minimal config
+	// verifying the broker hostname is built automatically.
+	TLSConfig *tls.Config
+	// Will is the optional Last Will and Testament published by the broker
+	// if the connection drops without a clean DISCONNECT.
+	Will *Will
+	// Logger receives structured diagnostics. Defaults to [slog.Default].
+	Logger *slog.Logger
 }
 
-// subscriberEntry stores the handler and the QoS level a filter was
-// originally subscribed at. The QoS is replayed on reconnect so every
-// filter is restored at the same delivery guarantee the caller
-// requested, rather than being silently upgraded/downgraded to a fixed
-// level.
-type subscriberEntry struct {
+// subscription is one registered filter: the wire options it was
+// subscribed with (replayed verbatim on reconnect so the delivery
+// guarantee is preserved) and the handler inbound matches route to. token
+// is a monotonic stamp assigned on every registration so a failed
+// SUBSCRIBE's rollback can tell whether a concurrent Subscribe for the same
+// filter has since superseded it (and must not be clobbered).
+type subscription struct {
+	filter  string
 	handler MessageHandler
-	qos     QoS
+	options protocol.SubscribeOptions
+	token   uint64
 }
 
-// TCPClient is a pure-Go MQTT 3.1.1 client used by the Bridge's
-// Lifecycle.
+// ackResult is delivered to a Publish/Subscribe waiter when its
+// acknowledgement (PUBACK/PUBCOMP/SUBACK/UNSUBACK, or a QoS 2 PUBREC
+// failure) arrives, or when the connection drops. A non-nil err means the
+// exchange did not complete; otherwise code carries the broker reason code
+// and reason its optional Reason String.
+type ackResult struct {
+	err    error
+	reason string
+	code   ReasonCode
+}
+
+// link is the mutable per-connection state. Every field is owned by one
+// connection; a reconnect builds a fresh link and swaps it in atomically,
+// so the read and keep-alive loops never observe a half-torn-down
+// connection through shared nil-able fields.
 //
-// It implements both [Client] (Publish + Subscribe/Unsubscribe) and
-// [Connector] (Connect + Disconnect) so the bridge composes one
-// object for the full lifecycle.
-type TCPClient struct {
-	cfg    TCPConfig
-	logger *slog.Logger
+// aliases (the inbound topic-alias table) is touched only by the read loop
+// and therefore needs no lock. sendMu guards buf and w so concurrent
+// writers (Publish, the keep-alive ping, read-loop acks) never interleave
+// a half-encoded frame on the wire.
+type link struct {
+	conn net.Conn
+	r    *bufio.Reader
+	w    *bufio.Writer
 
-	mu     sync.Mutex
-	conn   net.Conn
-	writer *bufio.Writer
-	reader *bufio.Reader
+	sendMu sync.Mutex
+	buf    bytes.Buffer
 
-	nextID atomic.Uint32
+	stop      chan struct{}
+	closeOnce sync.Once
+	wg        sync.WaitGroup
 
-	ackMu sync.Mutex
-	acks  map[uint16]chan struct{}
+	aliases map[uint16]string
 
-	subMu       sync.RWMutex
-	subscribers map[string]subscriberEntry
-
-	sendMu sync.Mutex // serialises frame writes
-
-	// pingInterval is how often keepAliveLoop sends a PINGREQ; it also
-	// bounds the PINGRESP watchdog window. Defaults to KeepAlive/2 in
-	// NewTCPClient; tests override it directly to avoid the 30s floor.
-	pingInterval time.Duration
-	// outstandingPings counts PINGREQs sent since the last PINGRESP was
-	// observed: keepAliveLoop increments it after each ping, readLoop
-	// resets it to 0 on any PINGRESP. The socket is declared dead only
-	// once it reaches pingTimeoutThreshold — i.e. two consecutive pings
-	// (≈ one full KeepAlive at the default pingInterval) go unanswered —
-	// so a single delayed or dropped PINGRESP (a GC pause, a scheduler
-	// stall on a CPU-throttled host, a momentary network blip) does not
-	// trip a spurious `ping_timeout` + reconnect. A genuinely half-open
-	// socket is still detected, just one pingInterval later.
+	outboundMax      uint32 // broker Maximum Packet Size; 0 = unlimited
+	inboundMax       uint32 // our advertised cap, wired to ReadFrame
+	pingInterval     time.Duration
 	outstandingPings atomic.Int32
+}
 
-	stop    chan struct{}
-	stopped atomic.Bool
-	wg      sync.WaitGroup
+// TCPClient is a reconnecting MQTT 3.1.1 / 5.0 client over TCP or TLS. It
+// implements both [Client] (Publish + Subscribe/Unsubscribe) and
+// [Connector] (Connect + Disconnect) so a [Lifecycle] can drive its full
+// lifecycle, plus [ConnectionNotifier] for event-driven reconnects.
+//
+// Lock ordering. The client holds several independent short-lived locks;
+// to stay deadlock-free they are always acquired in this order and no lock
+// is ever held across a blocking channel receive or a socket write:
+//
+//	quota.mu → ids.mu → store.mu → waitersMu → link.sendMu
+//
+// In practice these critical sections do not nest: the read loop signals a
+// waiter (waitersMu) and then, separately, writes a reply (sendMu); the
+// publish path acquires quota, then an id, saves to the store, registers a
+// waiter, and only then writes. link.sendMu is a leaf — nothing else is
+// acquired while it is held. subsMu (the subscription slice) is
+// independent of all the above; the read loop copies the matching handlers
+// out from under it before invoking them.
+type TCPClient struct {
+	cfg     TCPConfig
+	logger  *slog.Logger
+	version protocol.Version
 
-	// connectedAt holds the wall-clock instant of the most recent
-	// successful TCP+CONNECT round-trip. Cleared on Disconnect.
-	// Read by the diagnostics health probe; never the hot path.
-	connectedAt atomic.Pointer[time.Time]
+	inboundMax uint32
+	// pingInterval, when non-zero, overrides the keep-alive-derived ping
+	// schedule. It exists only so package tests can drive the watchdog
+	// faster than the 30s keep-alive floor allows.
+	pingInterval time.Duration
 
-	// lostCh is signalled (non-blocking, buffered) when the read or
-	// keep-alive loop detects the connection dropped, so an event-driven
-	// reconnect loop can react immediately instead of polling. Consumers
-	// that don't read it incur a single harmless buffered send.
+	link atomic.Pointer[link]
+
+	ids   idAllocator
+	store SessionStore
+	quota *quota
+
+	subsMu sync.RWMutex
+	subs   []subscription
+	subSeq uint64 // monotonic registration stamp, guarded by subsMu
+
+	waitersMu sync.Mutex
+	waiters   map[uint16]chan ackResult
+
 	lostCh chan struct{}
+
+	result      atomic.Pointer[ConnectResult]
+	connectedAt atomic.Pointer[time.Time]
 }
 
-// ConnectionLost returns a channel that receives a value whenever the client
-// detects its connection dropped (read/keep-alive failure). Buffered (size 1)
-// so a drop is never missed; drained by the consumer's reconnect loop.
-func (c *TCPClient) ConnectionLost() <-chan struct{} { return c.lostCh }
+// Compile-time confirmation that TCPClient satisfies every contract a
+// bridge composes it for.
+var (
+	_ Client             = (*TCPClient)(nil)
+	_ Connector          = (*TCPClient)(nil)
+	_ ConnectionNotifier = (*TCPClient)(nil)
+)
 
-// IsConnected reports whether the client currently holds an active
-// MQTT session. Used by the diagnostics health probe to derive the
-// `mqtt` health component.
-func (c *TCPClient) IsConnected() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.conn != nil && !c.stopped.Load()
-}
-
-// LastConnectedAt returns the timestamp of the most recent successful
-// connect, or the zero time when no connect has happened yet.
-func (c *TCPClient) LastConnectedAt() time.Time {
-	p := c.connectedAt.Load()
-	if p == nil {
-		return time.Time{}
-	}
-	return *p
-}
-
-// NewTCPClient constructs a new client.
+// NewTCPClient constructs a client from cfg, applying defaults for any
+// unset timing/limit field. It does not dial; call [TCPClient.Connect].
 func NewTCPClient(cfg TCPConfig) *TCPClient {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	if cfg.KeepAlive < 30*time.Second {
-		cfg.KeepAlive = 30 * time.Second
+	if cfg.ProtocolVersion == 0 {
+		cfg.ProtocolVersion = ProtocolV50
+	}
+	if cfg.KeepAlive < keepAliveFloor {
+		cfg.KeepAlive = keepAliveFloor
 	}
 	if cfg.DialTimeout == 0 {
-		cfg.DialTimeout = 10 * time.Second
+		cfg.DialTimeout = defaultDialTimeout
 	}
 	if cfg.AckTimeout == 0 {
-		cfg.AckTimeout = 20 * time.Second
+		cfg.AckTimeout = defaultAckTimeout
+	}
+	inboundMax := cfg.MaximumPacketSize
+	if inboundMax == 0 {
+		inboundMax = defaultMaxPacketSize
 	}
 	return &TCPClient{
-		cfg:          cfg,
-		logger:       cfg.Logger,
-		acks:         make(map[uint16]chan struct{}),
-		subscribers:  make(map[string]subscriberEntry),
-		stop:         make(chan struct{}),
-		lostCh:       make(chan struct{}, 1),
-		pingInterval: cfg.KeepAlive / 2,
+		cfg:        cfg,
+		logger:     cfg.Logger,
+		version:    cfg.ProtocolVersion,
+		inboundMax: inboundMax,
+		store:      newMemStore(),
+		quota:      newQuota(0),
+		waiters:    make(map[uint16]chan ackResult),
+		lostCh:     make(chan struct{}, 1),
 	}
 }
 
-// Connect implements [Connector]. It dials, sends CONNECT, waits for
-// CONNACK, and starts the read pump + keep-alive loop.
-func (c *TCPClient) Connect(ctx context.Context) error {
-	c.mu.Lock()
-	if c.conn != nil {
-		c.mu.Unlock()
-		return errors.New("mqtt/tcp: already connected")
+// ConnectionLost returns a channel that receives a value whenever the
+// client detects its connection dropped. It is buffered (size 1) so a drop
+// is never missed by a lifecycle loop that reacts to it.
+func (c *TCPClient) ConnectionLost() <-chan struct{} { return c.lostCh }
+
+// IsConnected reports whether the client currently holds a link.
+func (c *TCPClient) IsConnected() bool { return c.link.Load() != nil }
+
+// LastConnectedAt returns the wall-clock instant of the most recent
+// successful CONNECT, or the zero time when none has happened.
+func (c *TCPClient) LastConnectedAt() time.Time {
+	if p := c.connectedAt.Load(); p != nil {
+		return *p
 	}
-	c.mu.Unlock()
+	return time.Time{}
+}
+
+// ConnectResult returns the negotiated session state from the most recent
+// successful connect. The bool is false before the first connect.
+func (c *TCPClient) ConnectResult() (ConnectResult, bool) {
+	if p := c.result.Load(); p != nil {
+		return *p, true
+	}
+	return ConnectResult{}, false
+}
+
+// Connect implements [Connector]. It dials, sends CONNECT, waits for
+// CONNACK, applies the negotiated limits, replays any resumable session
+// state and prior subscriptions, and starts the read and keep-alive loops.
+// A live link makes it a no-op that returns a wrapped [ErrAlreadyConnected]
+// so [Lifecycle] treats it as idempotent.
+func (c *TCPClient) Connect(ctx context.Context) error {
+	if c.link.Load() != nil {
+		return fmt.Errorf("mqtt/tcp: %w", ErrAlreadyConnected)
+	}
 
 	u, err := url.Parse(c.cfg.BrokerURL)
 	if err != nil {
@@ -177,117 +301,251 @@ func (c *TCPClient) Connect(ctx context.Context) error {
 		return fmt.Errorf("mqtt/tcp: dial: %w", err)
 	}
 
-	pkt := &protocol.ConnectPacket{
-		ClientID:     c.cfg.ClientID,
-		KeepAlive:    uint16(c.cfg.KeepAlive.Seconds()), //nolint:gosec // clamped above
-		Username:     c.cfg.Username,
-		Password:     c.cfg.Password,
-		CleanSession: c.cfg.CleanSession,
-		WillTopic:    c.cfg.WillTopic,
-		WillPayload:  c.cfg.WillPayload,
-		WillRetain:   c.cfg.WillRetain,
-	}
 	bw := bufio.NewWriter(conn)
-	if err := pkt.Encode(bw); err != nil {
+	if err := c.buildConnectPacket().Encode(bw); err != nil {
 		_ = conn.Close()
 		return err
 	}
 	if err := bw.Flush(); err != nil {
 		_ = conn.Close()
-		return err
+		return fmt.Errorf("mqtt/tcp: send connect: %w", err)
 	}
 
 	_ = conn.SetReadDeadline(time.Now().Add(c.cfg.DialTimeout))
 	br := bufio.NewReader(conn)
-	frame, err := protocol.ReadFrame(br)
+	frame, err := protocol.ReadFrame(br, c.inboundMax)
 	if err != nil {
 		_ = conn.Close()
 		return fmt.Errorf("mqtt/tcp: read connack: %w", err)
 	}
-	if frame.PacketType() != protocol.PacketConnack {
+	if frame.PacketType() != protocol.Connack {
 		_ = conn.Close()
-		return fmt.Errorf("mqtt/tcp: unexpected packet %d instead of CONNACK", frame.PacketType())
+		return fmt.Errorf("mqtt/tcp: expected CONNACK, got %s", frame.PacketType())
 	}
-	ack, err := protocol.DecodeConnack(frame.Body)
+	ack, err := protocol.DecodeConnack(c.version, frame.Body)
 	if err != nil {
 		_ = conn.Close()
 		return err
 	}
-	if ack.ReturnCode != 0 {
+	if ack.ReasonCode.IsError() {
 		_ = conn.Close()
-		return fmt.Errorf("mqtt/tcp: CONNACK return code %d", ack.ReturnCode)
+		return &ReasonError{Packet: "CONNECT", Code: ack.ReasonCode, Reason: reasonStringOf(ack.Properties)}
+	}
+	if err := validateConnackLimits(c.version, ack); err != nil {
+		// The broker advertised a §3.2.2.3 Protocol Error (Receive Maximum or
+		// Maximum Packet Size of 0). Refuse the session with a best-effort
+		// DISCONNECT(0x82) rather than proceeding with a corrupt send quota or
+		// packet-size limit.
+		dp := &protocol.DisconnectPacket{Version: c.version, ReasonCode: protocol.ProtocolErrorReason}
+		_ = dp.Encode(bw)
+		_ = bw.Flush()
+		_ = conn.Close()
+		return err
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 
-	c.mu.Lock()
-	c.conn = conn
-	c.writer = bw
-	c.reader = br
-	c.stop = make(chan struct{})
-	stopCh := c.stop
-	c.stopped.Store(false)
-	c.outstandingPings.Store(0)
-	c.mu.Unlock()
+	result := c.buildConnectResult(ack)
+	c.result.Store(&result)
+
+	l := &link{
+		conn:         conn,
+		r:            br,
+		w:            bw,
+		stop:         make(chan struct{}),
+		aliases:      make(map[uint16]string),
+		outboundMax:  result.MaximumPacketSize,
+		inboundMax:   c.inboundMax,
+		pingInterval: c.effectivePingInterval(result),
+	}
+
+	c.applySession(result)
+	c.link.Store(l)
 	now := time.Now()
 	c.connectedAt.Store(&now)
 
-	c.wg.Add(2)
-	go c.readLoop(stopCh)
-	go c.keepAliveLoop(stopCh)
+	c.replaySession(l)
+	c.replaySubscriptions(l)
 
-	// Replay any prior subscriptions on reconnect. Without this, a
-	// CleanSession=true client (the typical daemon configuration)
-	// loses every SUBSCRIBE on the previous socket and the new
-	// session starts with an empty filter set — HA's
-	// `set_temperature` / `set_mode` / `set_profile` commands
-	// arrive at the broker but are never delivered to the daemon.
-	c.subMu.RLock()
-	type filterQoS struct {
-		filter string
-		qos    QoS
-	}
-	subs := make([]filterQoS, 0, len(c.subscribers))
-	for f, entry := range c.subscribers {
-		subs = append(subs, filterQoS{filter: f, qos: entry.qos})
-	}
-	c.subMu.RUnlock()
-	for _, s := range subs {
-		pkt := &protocol.SubscribePacket{PacketID: c.nextPacketID(), TopicFilter: s.filter, QoS: byte(s.qos)}
-		if err := c.writeFrame(pkt); err != nil {
-			c.logger.Warn("mqtt.tcp.resubscribe",
-				slog.String("filter", s.filter),
-				slog.String("err", err.Error()))
-		}
-	}
+	l.wg.Add(2)
+	go c.readLoop(l)
+	go c.keepAliveLoop(l)
 
-	c.logger.Info("mqtt.tcp.connected", slog.String("broker", c.cfg.BrokerURL))
+	c.logger.Info("mqtt.tcp.connected",
+		slog.String("broker", c.cfg.BrokerURL),
+		slog.String("version", c.version.String()),
+		slog.Bool("session_present", result.SessionPresent))
 	return nil
 }
 
-// Disconnect implements [Connector]. It sends DISCONNECT, closes the
-// socket, and waits for the goroutines to exit.
+// applySession decides whether the resumed session state survives this
+// connect. A clean start, a zero MQTT 5.0 Session Expiry, or a broker that
+// did not resume the session (Session Present = 0) all discard the stored
+// QoS>0 state, free the packet identifiers and resize the send quota from
+// scratch. Otherwise the store and identifiers are kept for replay.
+//
+// The quota is seeded with the negotiated ceiling minus the number of
+// QoS>0 messages still in flight: on a resumed session those are exactly
+// the StoredPublish/StoredPubrel entries replaySession is about to put back
+// on the wire, and they must keep counting against Receive Maximum until
+// their acks arrive (§4.9). On a reset session the store was just cleared,
+// so the in-flight count is zero and the quota starts at the full ceiling.
+func (c *TCPClient) applySession(result ConnectResult) {
+	reset := c.cfg.CleanStart ||
+		(c.version == protocol.V50 && c.cfg.SessionExpirySeconds == 0) ||
+		!result.SessionPresent
+	if reset {
+		_ = c.store.Reset()
+		c.ids.Reset()
+	}
+	size := c.quotaSize(result) - c.inflightPermits()
+	if size < 0 {
+		size = 0
+	}
+	c.quota.reset(size)
+}
+
+// quotaSize is the number of concurrent in-flight outbound QoS>0 sends the
+// broker permits: its advertised Receive Maximum on MQTT 5.0, the
+// configured MaxInflight on MQTT 3.1.1.
+func (c *TCPClient) quotaSize(result ConnectResult) int {
+	if c.version == protocol.V50 {
+		return int(result.ReceiveMaximum)
+	}
+	if c.cfg.MaxInflight != 0 {
+		return int(c.cfg.MaxInflight)
+	}
+	return defaultReceiveMaximum
+}
+
+// inflightPermits counts the outbound QoS>0 exchanges still awaiting a
+// terminal acknowledgement — the StoredPublish and StoredPubrel entries,
+// each of which holds a send-quota permit. StoredInboundID (receiver-side
+// state) does not count. Used to seed the quota on (re)connect so the
+// resumed-session replay set stays accounted for against Receive Maximum.
+func (c *TCPClient) inflightPermits() int {
+	msgs, err := c.store.All()
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, m := range msgs {
+		if m.Kind == StoredPublish || m.Kind == StoredPubrel {
+			n++
+		}
+	}
+	return n
+}
+
+// replaySession retransmits the resumable QoS>0 state in ascending Seq
+// order before any new traffic: an unacknowledged PUBLISH is resent with
+// the DUP flag set, a PUBREL leg is resent as-is. Completions arriving for
+// these have no waiter and are logged at debug by the read loop.
+func (c *TCPClient) replaySession(l *link) {
+	msgs, err := c.store.All()
+	if err != nil {
+		c.logger.Warn("mqtt.tcp.replay_load", slog.String("err", err.Error()))
+		return
+	}
+	for _, m := range msgs {
+		switch m.Kind {
+		case StoredPublish:
+			if m.Publish == nil {
+				continue
+			}
+			p := *m.Publish
+			p.Dup = true
+			if err := c.writeFrame(l, p.Encode); err != nil {
+				c.logger.Warn("mqtt.tcp.replay_publish",
+					slog.Uint64("packet_id", uint64(m.ID)), slog.String("err", err.Error()))
+			}
+		case StoredPubrel:
+			ack := &protocol.AckPacket{Version: c.version, Type: protocol.Pubrel, PacketID: m.ID}
+			if err := c.writeFrame(l, ack.EncodeAck); err != nil {
+				c.logger.Warn("mqtt.tcp.replay_pubrel",
+					slog.Uint64("packet_id", uint64(m.ID)), slog.String("err", err.Error()))
+			}
+		case StoredInboundID:
+			// Receiver-side exactly-once state: nothing to retransmit.
+		}
+	}
+}
+
+// replaySubscriptions re-sends every registered subscription on a fresh
+// connection. Without this a CleanStart=true reconnect (the common bridge
+// configuration) silently loses every SUBSCRIBE from the previous socket
+// and inbound command topics stop being delivered even though the broker
+// happily accepts publishes to them.
+//
+// It is fire-and-log: the SUBACK is awaited in a detached goroutine that
+// only surfaces a rejection, so a slow or hostile broker cannot stall the
+// connect path, and the identifier is returned once the ack (or the
+// connection drop) resolves.
+func (c *TCPClient) replaySubscriptions(l *link) {
+	c.subsMu.RLock()
+	subs := make([]subscription, len(c.subs))
+	copy(subs, c.subs)
+	c.subsMu.RUnlock()
+
+	for _, s := range subs {
+		id, err := c.ids.Acquire()
+		if err != nil {
+			c.logger.Warn("mqtt.tcp.resubscribe", slog.String("filter", s.filter), slog.String("err", err.Error()))
+			continue
+		}
+		pkt := &protocol.SubscribePacket{
+			Version:       c.version,
+			PacketID:      id,
+			Subscriptions: []protocol.Subscription{{Filter: s.filter, Options: s.options}},
+		}
+		ch := c.registerWaiter(id)
+		if err := c.writeFrame(l, pkt.Encode); err != nil {
+			c.removeWaiter(id)
+			c.ids.Release(id)
+			c.logger.Warn("mqtt.tcp.resubscribe", slog.String("filter", s.filter), slog.String("err", err.Error()))
+			continue
+		}
+		l.wg.Add(1)
+		go c.awaitResubscribe(l, id, s.filter, ch)
+	}
+}
+
+// awaitResubscribe consumes the SUBACK for a replayed subscription and logs
+// a rejection, then frees the identifier. A connection drop resolves it via
+// the failed waiter or the link's stop channel.
+func (c *TCPClient) awaitResubscribe(l *link, id uint16, filter string, ch chan ackResult) {
+	defer l.wg.Done()
+	var res ackResult
+	select {
+	case res = <-ch:
+	case <-l.stop:
+		c.removeWaiter(id)
+		c.ids.Release(id)
+		return
+	}
+	c.ids.Release(id)
+	if res.err != nil {
+		return
+	}
+	if res.code.IsError() {
+		c.logger.Warn("mqtt.tcp.resubscribe_rejected",
+			slog.String("filter", filter), slog.String("reason", res.code.String()))
+	}
+}
+
+// Disconnect implements [Connector]. It sends a best-effort DISCONNECT,
+// tears the link down gracefully (no connection-lost signal), and waits —
+// bounded by ctx — for the read and keep-alive loops to exit.
 func (c *TCPClient) Disconnect(ctx context.Context) error {
-	c.mu.Lock()
-	conn := c.conn
-	if conn == nil {
-		c.mu.Unlock()
+	l := c.link.Load()
+	if l == nil {
 		return nil
 	}
-	if c.stopped.CompareAndSwap(false, true) {
-		close(c.stop)
-	}
-	c.conn = nil
-	c.mu.Unlock()
-
-	// Best effort: a graceful DISCONNECT.
-	c.sendMu.Lock()
-	_ = protocol.EncodeDisconnect(c.writer)
-	_ = c.writer.Flush()
-	c.sendMu.Unlock()
-	_ = conn.Close()
+	dp := &protocol.DisconnectPacket{Version: c.version, ReasonCode: protocol.NormalDisconnection}
+	_ = c.writeFrame(l, dp.Encode)
+	c.teardownLink(l, true)
 
 	done := make(chan struct{})
-	go func() { c.wg.Wait(); close(done) }()
+	go func() { l.wg.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-ctx.Done():
@@ -296,374 +554,393 @@ func (c *TCPClient) Disconnect(ctx context.Context) error {
 	return nil
 }
 
-// Publish implements [Publisher]. QoS 0 is fire-and-forget; QoS 1
-// waits for PUBACK up to cfg.AckTimeout.
-func (c *TCPClient) Publish(ctx context.Context, topic string, payload []byte, qos QoS, retain bool) error {
-	if qos > QoS1 {
-		return fmt.Errorf("mqtt/tcp: unsupported QoS %d", qos)
+// writeFrame encodes one packet fully into the link's scratch buffer under
+// sendMu, enforces the negotiated outbound size limit, then writes and
+// flushes it in a single pass so a partial write never leaves a truncated
+// fixed header on the wire. A nil link (already disconnected) yields
+// [ErrNotConnected].
+func (c *TCPClient) writeFrame(l *link, encode func(io.Writer) error) error {
+	if l == nil {
+		return ErrNotConnected
 	}
-	pkt := &protocol.PublishPacket{Topic: topic, Payload: payload, QoS: byte(qos), Retain: retain}
-	if qos == 0 {
-		return c.writeFrame(pkt)
-	}
-
-	pkt.PacketID = c.nextPacketID()
-	// Register the ack channel BEFORE the PUBLISH hits the wire —
-	// otherwise the broker can answer faster than the registration
-	// runs (loopback paths do this routinely) and the PUBACK
-	// arrives at the read loop while c.acks is still empty.
-	ch := make(chan struct{})
-	c.ackMu.Lock()
-	c.acks[pkt.PacketID] = ch
-	c.ackMu.Unlock()
-	defer c.removeAck(pkt.PacketID)
-
-	if err := c.writeFrame(pkt); err != nil {
+	l.sendMu.Lock()
+	defer l.sendMu.Unlock()
+	l.buf.Reset()
+	if err := encode(&l.buf); err != nil {
 		return err
 	}
-
-	select {
-	case <-ch:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(c.cfg.AckTimeout):
-		return fmt.Errorf("mqtt/tcp: PUBACK timeout (id=%d)", pkt.PacketID)
+	if l.outboundMax != 0 && uint32(l.buf.Len()) > l.outboundMax { //nolint:gosec // buf length is non-negative
+		return ErrPacketTooLarge
 	}
-}
-
-// Subscribe implements [Subscriber]. Only one handler per topic
-// filter — re-subscribing replaces the previous handler.
-//
-// See [MessageHandler] for the non-blocking contract handler must
-// satisfy: it runs synchronously in the read loop, so a slow handler
-// delays PUBACK/PINGRESP handling and can trip the keep-alive watchdog.
-func (c *TCPClient) Subscribe(ctx context.Context, filter string, qos QoS, handler MessageHandler) error {
-	pkt := &protocol.SubscribePacket{PacketID: c.nextPacketID(), TopicFilter: filter, QoS: byte(qos)}
-	if err := c.writeFrame(pkt); err != nil {
+	if _, err := l.w.Write(l.buf.Bytes()); err != nil {
 		return err
 	}
-	c.subMu.Lock()
-	c.subscribers[filter] = subscriberEntry{handler: handler, qos: qos}
-	c.subMu.Unlock()
-	_ = ctx
-	return nil
+	return l.w.Flush()
 }
 
-// Unsubscribe implements [Subscriber].
-func (c *TCPClient) Unsubscribe(ctx context.Context, filter string) error {
-	pkt := &protocol.UnsubscribePacket{PacketID: c.nextPacketID(), TopicFilter: filter}
-	if err := c.writeFrame(pkt); err != nil {
-		return err
-	}
-	c.subMu.Lock()
-	delete(c.subscribers, filter)
-	c.subMu.Unlock()
-	_ = ctx
-	return nil
-}
-
-// --- internals ---
-
-func (c *TCPClient) dial(ctx context.Context, u *url.URL) (net.Conn, error) {
-	host := u.Host
-	if u.Port() == "" {
-		switch u.Scheme {
-		case "tls", "ssl", "mqtts":
-			host = net.JoinHostPort(u.Hostname(), "8883")
-		default:
-			host = net.JoinHostPort(u.Hostname(), "1883")
+// teardownLink closes a connection exactly once. It stops the loops, closes
+// the socket, clears the link pointer if it is still current, fails every
+// in-flight waiter with [ErrConnectionLost] and marks the quota failed so
+// parked sends unblock immediately. The stored session state, inbound
+// dedup set and in-flight identifiers are deliberately KEPT so a resumed
+// session can complete them. When graceful is false (a detected drop, not a
+// caller Disconnect) it signals the connection-lost channel so a lifecycle
+// loop reconnects.
+func (c *TCPClient) teardownLink(l *link, graceful bool) {
+	l.closeOnce.Do(func() {
+		close(l.stop)
+		_ = l.conn.Close()
+		c.link.CompareAndSwap(l, nil)
+		c.failAllWaiters()
+		c.quota.fail()
+		if !graceful {
+			select {
+			case c.lostCh <- struct{}{}:
+			default:
+			}
 		}
-	}
-	dialer := &net.Dialer{}
-	switch u.Scheme {
-	case "tcp", "mqtt", "":
-		return dialer.DialContext(ctx, "tcp", host)
-	case "tls", "ssl", "mqtts":
-		tcpConn, err := dialer.DialContext(ctx, "tcp", host)
-		if err != nil {
-			return nil, err
-		}
-		tlsConn := tls.Client(tcpConn, c.cfg.TLSConfig)
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			_ = tcpConn.Close()
-			return nil, err
-		}
-		return tlsConn, nil
-	}
-	return nil, fmt.Errorf("mqtt/tcp: unsupported scheme %q", u.Scheme)
+	})
 }
 
-type frameEncoder interface {
-	Encode(w io.Writer) error
+// registerWaiter installs a buffered result channel for the packet
+// identifier so the read loop can hand the acknowledgement back to the
+// blocked Publish/Subscribe caller.
+func (c *TCPClient) registerWaiter(id uint16) chan ackResult {
+	ch := make(chan ackResult, 1)
+	c.waitersMu.Lock()
+	c.waiters[id] = ch
+	c.waitersMu.Unlock()
+	return ch
 }
 
-func (c *TCPClient) writeFrame(pkt frameEncoder) error {
-	c.sendMu.Lock()
-	defer c.sendMu.Unlock()
-	c.mu.Lock()
-	writer := c.writer
-	c.mu.Unlock()
-	if writer == nil {
-		return errors.New("mqtt/tcp: not connected")
+// removeWaiter drops the waiter for id. Safe to call for an already-removed
+// id.
+func (c *TCPClient) removeWaiter(id uint16) {
+	c.waitersMu.Lock()
+	delete(c.waiters, id)
+	c.waitersMu.Unlock()
+}
+
+// signalWaiter delivers res to the waiter for id (removing it) and reports
+// whether one was registered. The send is non-blocking: the channel is
+// buffered and each waiter is signalled at most once.
+func (c *TCPClient) signalWaiter(id uint16, res ackResult) bool {
+	c.waitersMu.Lock()
+	ch, ok := c.waiters[id]
+	if ok {
+		delete(c.waiters, id)
 	}
-	if err := pkt.Encode(writer); err != nil {
-		return err
-	}
-	return writer.Flush()
-}
-
-func (c *TCPClient) nextPacketID() uint16 {
-	for {
-		v := c.nextID.Add(1)
-		id := uint16(v & 0xFFFF) //nolint:gosec // ringed at 16-bit on purpose
-		if id == 0 {
-			continue
-		}
-		return id
-	}
-}
-
-func (c *TCPClient) removeAck(id uint16) {
-	c.ackMu.Lock()
-	delete(c.acks, id)
-	c.ackMu.Unlock()
-}
-
-func (c *TCPClient) readLoop(stop <-chan struct{}) {
-	defer c.wg.Done()
-	for {
+	c.waitersMu.Unlock()
+	if ok {
 		select {
-		case <-stop:
-			return
+		case ch <- res:
 		default:
 		}
-		c.mu.Lock()
-		reader := c.reader
-		c.mu.Unlock()
-		if reader == nil {
-			return
-		}
-		frame, err := protocol.ReadFrame(reader)
-		if err != nil {
-			if !c.stopped.Load() {
-				c.logger.Warn("mqtt.tcp.read", slog.String("err", err.Error()))
-				// Tear down the broken socket so the lifecycle's
-				// reconnect loop can establish a fresh connection.
-				// Without this, `c.conn` stays non-nil after the
-				// remote side closes the TCP socket, the next
-				// [Connect] returns `mqtt/tcp: already connected`,
-				// and the daemon's subscriptions silently die —
-				// HA's `set_temperature` / `set_mode` /
-				// `set_profile` MQTT commands stop reaching the
-				// service-method handler.
-				c.handleConnectionLost()
-			}
-			return
-		}
-		switch frame.PacketType() { //nolint:exhaustive // outbound-only packet types never reach the read path
-		case protocol.PacketPublish:
-			ib, err := protocol.DecodePublish(frame.Header, frame.Body)
-			if err != nil {
-				c.logger.Warn("mqtt.tcp.malformed_publish", slog.String("err", err.Error()))
-				continue
-			}
-			c.dispatch(ib)
-			if ib.QoS == 1 {
-				c.sendMu.Lock()
-				_ = protocol.EncodePuback(c.writer, ib.PacketID)
-				_ = c.writer.Flush()
-				c.sendMu.Unlock()
-			}
-		case protocol.PacketPuback:
-			if p, err := protocol.DecodePuback(frame.Body); err == nil {
-				c.ackMu.Lock()
-				if ch, ok := c.acks[p.PacketID]; ok {
-					close(ch)
-					delete(c.acks, p.PacketID)
-				}
-				c.ackMu.Unlock()
-			}
-		case protocol.PacketPingresp:
-			// Heartbeat ack: the broker is alive, so reset the
-			// outstanding-ping counter keepAliveLoop bumps per PINGREQ.
-			c.outstandingPings.Store(0)
-		case protocol.PacketSuback:
-			// Subscribe/unsubscribe calls return as soon as the frame
-			// is on the wire (non-blocking in our MVP — no caller
-			// waits on this SUBACK), but a rejected filter is still
-			// worth surfacing: without this, HA's `set_temperature` /
-			// `set_mode` / `set_profile` command topics could silently
-			// never be delivered because the broker refused the
-			// subscription (bad ACL, disallowed filter, ...) and
-			// nothing would ever say so.
-			sub, err := protocol.DecodeSuback(frame.Body)
-			if err != nil {
-				c.logger.Warn("mqtt.tcp.malformed_suback", slog.String("err", err.Error()))
-				continue
-			}
-			for _, rc := range sub.ReturnCodes {
-				if rc == protocol.SubackFailure {
-					c.logger.Warn("mqtt.tcp.subscribe_rejected",
-						slog.Uint64("packet_id", uint64(sub.PacketID)))
-					break
-				}
-			}
-		case protocol.PacketUnsuback:
-			// non-blocking in our MVP; the unsubscribe call returns as
-			// soon as the frame is on the wire.
-		}
 	}
+	return ok
 }
 
-// pingTimeoutThreshold is how many consecutive unanswered PINGREQs the
-// keep-alive watchdog tolerates before declaring the socket dead. Two
-// (≈ one full KeepAlive at the default pingInterval of KeepAlive/2)
-// rides out a single delayed or dropped PINGRESP — a GC pause, a
-// scheduler stall on a CPU-throttled host, a momentary network blip —
-// without a spurious `ping_timeout` + reconnect, while still catching a
-// genuinely half-open socket within 2×pingInterval.
-const pingTimeoutThreshold = 2
-
-func (c *TCPClient) keepAliveLoop(stop <-chan struct{}) {
-	defer c.wg.Done()
-	ticker := time.NewTicker(c.pingInterval)
-	defer ticker.Stop()
-	for {
+// failAllWaiters resolves every outstanding waiter with [ErrConnectionLost]
+// and clears the table. Called from teardownLink so no Publish/Subscribe
+// parks forever on a dead socket.
+func (c *TCPClient) failAllWaiters() {
+	c.waitersMu.Lock()
+	for id, ch := range c.waiters {
 		select {
-		case <-stop:
-			return
-		case <-ticker.C:
-			// Watchdog: PINGREQs from previous ticks that never drew a
-			// PINGRESP mean the socket is half-open — the broker or
-			// network vanished without a TCP FIN/RST, so readLoop stays
-			// blocked in ReadFrame forever and never trips
-			// handleConnectionLost. Once pingTimeoutThreshold pings go
-			// unanswered, declare the connection lost so the lifecycle
-			// reconnects. Without this, publishes silently time out on a
-			// dead socket until a manual restart.
-			if c.outstandingPings.Load() >= pingTimeoutThreshold {
-				c.logger.Warn("mqtt.tcp.ping_timeout")
-				c.handleConnectionLost()
-				return
-			}
-			c.sendMu.Lock()
-			c.mu.Lock()
-			writer := c.writer
-			c.mu.Unlock()
-			if writer == nil {
-				c.sendMu.Unlock()
-				return
-			}
-			if err := protocol.EncodePingReq(writer); err != nil {
-				c.sendMu.Unlock()
-				c.logger.Warn("mqtt.tcp.ping", slog.String("err", err.Error()))
-				c.handleConnectionLost()
-				return
-			}
-			if err := writer.Flush(); err != nil {
-				c.sendMu.Unlock()
-				c.logger.Warn("mqtt.tcp.ping", slog.String("err", err.Error()))
-				c.handleConnectionLost()
-				return
-			}
-			// Count this ping as outstanding only after it is on the
-			// wire; a PINGRESP resets the counter to 0.
-			c.outstandingPings.Add(1)
-			c.sendMu.Unlock()
+		case ch <- ackResult{err: ErrConnectionLost}:
+		default:
+		}
+		delete(c.waiters, id)
+	}
+	c.waitersMu.Unlock()
+}
+
+// addSubscription registers or replaces (in place, preserving order) the
+// handler and wire options for filter, and returns the fresh monotonic
+// token stamped on the registration so the caller can later detect whether
+// its registration is still current.
+func (c *TCPClient) addSubscription(filter string, options protocol.SubscribeOptions, handler MessageHandler) uint64 {
+	c.subsMu.Lock()
+	defer c.subsMu.Unlock()
+	c.subSeq++
+	token := c.subSeq
+	for i := range c.subs {
+		if c.subs[i].filter == filter {
+			c.subs[i].options = options
+			c.subs[i].handler = handler
+			c.subs[i].token = token
+			return token
 		}
 	}
+	c.subs = append(c.subs, subscription{filter: filter, handler: handler, options: options, token: token})
+	return token
 }
 
-// handleConnectionLost tears down the in-flight TCP socket after the
-// read or keep-alive loop has detected a remote-side close. Resets
-// `c.conn` / `c.reader` / `c.writer` to nil so the next
-// [TCPClient.Connect] call dials a fresh socket instead of returning
-// `mqtt/tcp: already connected`. Idempotent — concurrent callers
-// converge on the same nil-state.
-//
-// Without this, a connection lost mid-flight (broker restart, NAT
-// timeout, transient network glitch) leaves the lifecycle's
-// reconnect loop spinning on `already connected` errors forever:
-// the daemon's MQTT subscriptions silently expire and HA's
-// `set_temperature` / `set_mode` / `set_profile` commands stop
-// being delivered.
-func (c *TCPClient) handleConnectionLost() {
-	c.mu.Lock()
-	conn := c.conn
-	c.conn = nil
-	c.reader = nil
-	c.writer = nil
-	if c.stopped.CompareAndSwap(false, true) {
-		close(c.stop)
+// snapshotSubscription returns the current registration for filter, if
+// any — the undo state for a provisional [TCPClient.addSubscription]
+// that a failed SUBSCRIBE round-trip must roll back.
+func (c *TCPClient) snapshotSubscription(filter string) (subscription, bool) {
+	c.subsMu.Lock()
+	defer c.subsMu.Unlock()
+	for i := range c.subs {
+		if c.subs[i].filter == filter {
+			return c.subs[i], true
+		}
 	}
-	c.mu.Unlock()
-	if conn != nil {
-		_ = conn.Close()
-	}
-	// Wake any event-driven reconnect loop (non-blocking; coalesces).
-	select {
-	case c.lostCh <- struct{}{}:
-	default:
-	}
+	return subscription{}, false
 }
 
-// dispatch routes an inbound PUBLISH to its matching [MessageHandler].
-//
-// It runs synchronously, inline in [TCPClient.readLoop] — the same
-// goroutine that also decodes PUBACK/PINGRESP and feeds the PINGRESP
-// watchdog in keepAliveLoop. A handler that blocks (network calls,
-// waiting on a channel, heavy computation, ...) therefore stalls the
-// whole read pump: PUBACKs stop being processed, PINGRESPs stop being
-// observed, and the keep-alive watchdog can then declare the
-// connection lost (`mqtt.tcp.ping_timeout`) even though the socket is
-// perfectly healthy. See [MessageHandler] for the contract this
-// implies for every Subscribe callback.
-func (c *TCPClient) dispatch(ib *protocol.InboundPublish) {
-	c.subMu.RLock()
-	var handler MessageHandler
-	for filter, entry := range c.subscribers {
-		if topicMatches(filter, ib.Topic) {
-			handler = entry.handler
+// restoreSubscription undoes a provisional addSubscription (identified by
+// token) after a failed SUBSCRIBE: it reinstates the previous registration
+// (or removes the entry) ONLY while the provisional registration is still
+// the current one. A concurrent Subscribe for the same filter that
+// registered after ours bumps the token, so its registration is left intact
+// — rolling ours back would delete a subscription the broker has accepted
+// and is delivering to, silently dropping its inbound messages.
+func (c *TCPClient) restoreSubscription(filter string, prev subscription, existed bool, token uint64) {
+	c.subsMu.Lock()
+	defer c.subsMu.Unlock()
+	idx := -1
+	for i := range c.subs {
+		if c.subs[i].filter == filter {
+			idx = i
 			break
 		}
 	}
-	c.subMu.RUnlock()
-	if handler != nil {
-		handler(ib.Topic, ib.Payload, ib.Retain)
+	if idx == -1 || c.subs[idx].token != token {
+		// Superseded by a later Subscribe (or already gone): do not clobber.
+		return
 	}
+	if existed {
+		c.subs[idx].options = prev.options
+		c.subs[idx].handler = prev.handler
+		c.subs[idx].token = prev.token
+		return
+	}
+	c.subs = append(c.subs[:idx], c.subs[idx+1:]...)
 }
 
-// topicMatches implements the minimal MQTT wildcard rules the
-// bridge relies on: `+` matches one level, `#` matches multiple.
-func topicMatches(filter, topic string) bool {
-	if filter == topic {
-		return true
-	}
-	fp, tp := 0, 0
-	for fp < len(filter) && tp < len(topic) {
-		fc, tc := filter[fp], topic[tp]
-		switch fc {
-		case '#':
-			return true
-		case '+':
-			for tp < len(topic) && topic[tp] != '/' {
-				tp++
-			}
-			fp++
-		default:
-			if fc != tc {
-				return false
-			}
-			fp++
-			tp++
+// removeSubscription drops the registration for filter, if any.
+func (c *TCPClient) removeSubscription(filter string) {
+	c.subsMu.Lock()
+	defer c.subsMu.Unlock()
+	for i := range c.subs {
+		if c.subs[i].filter == filter {
+			c.subs = append(c.subs[:i], c.subs[i+1:]...)
+			return
 		}
 	}
-	return fp == len(filter) && tp == len(topic)
 }
 
-// Confirm TCPClient satisfies both bridge contracts at compile time.
-var (
-	_ Client    = (*TCPClient)(nil)
-	_ Connector = (*TCPClient)(nil)
-)
+// buildConnectPacket assembles the CONNECT for the configured version,
+// including the MQTT 5.0 property block advertising the client's limits and
+// the Last Will and Testament.
+func (c *TCPClient) buildConnectPacket() *protocol.ConnectPacket {
+	pkt := &protocol.ConnectPacket{
+		Version:    c.version,
+		ClientID:   c.cfg.ClientID,
+		KeepAlive:  c.keepAliveSeconds(),
+		Username:   c.cfg.Username,
+		Password:   c.cfg.Password,
+		CleanStart: c.cfg.CleanStart,
+	}
+	if c.cfg.Will != nil {
+		pkt.Will = buildWill(c.version, c.cfg.Will)
+	}
+	if c.version == protocol.V50 {
+		props := &protocol.Properties{}
+		if c.cfg.SessionExpirySeconds != 0 {
+			v := c.cfg.SessionExpirySeconds
+			props.SessionExpiryInterval = &v
+		}
+		if c.cfg.ReceiveMaximum != 0 {
+			v := c.cfg.ReceiveMaximum
+			props.ReceiveMaximum = &v
+		}
+		maxPkt := c.inboundMax
+		props.MaximumPacketSize = &maxPkt
+		if c.cfg.TopicAliasMaximum != 0 {
+			v := c.cfg.TopicAliasMaximum
+			props.TopicAliasMaximum = &v
+		}
+		props.UserProperties = c.cfg.UserProperties
+		pkt.Properties = props
+	}
+	return pkt
+}
+
+// keepAliveSeconds is the CONNECT keep-alive value in whole seconds.
+func (c *TCPClient) keepAliveSeconds() uint16 {
+	s := c.cfg.KeepAlive / time.Second
+	if s > 0xFFFF {
+		return 0xFFFF
+	}
+	return uint16(s) //nolint:gosec // clamped to uint16 range above
+}
+
+// buildWill translates the public [Will] into the wire form, attaching the
+// MQTT 5.0 will property block only on a v5 link.
+func buildWill(v protocol.Version, w *Will) *protocol.Will {
+	pw := &protocol.Will{
+		Topic:   w.Topic,
+		Payload: w.Payload,
+		QoS:     byte(w.QoS),
+		Retain:  w.Retain,
+	}
+	if v != protocol.V50 {
+		return pw
+	}
+	props := &protocol.Properties{
+		ContentType:     w.ContentType,
+		ResponseTopic:   w.ResponseTopic,
+		CorrelationData: w.CorrelationData,
+		UserProperties:  w.UserProperties,
+	}
+	if w.PayloadFormatUTF8 {
+		one := byte(1)
+		props.PayloadFormat = &one
+	}
+	if w.MessageExpirySeconds != 0 {
+		v := w.MessageExpirySeconds
+		props.MessageExpiryInterval = &v
+	}
+	if w.DelayIntervalSeconds != 0 {
+		v := w.DelayIntervalSeconds
+		props.WillDelayInterval = &v
+	}
+	pw.Properties = props
+	return pw
+}
+
+// validateConnackLimits rejects the MQTT 5.0 CONNACK limits the spec
+// declares a Protocol Error the client MUST refuse: a Receive Maximum of 0
+// (§3.2.2.3.3) — which would starve the send quota and hang every QoS>0
+// Publish — and a Maximum Packet Size of 0 (§3.2.2.3.6). Both surface an
+// error wrapping [protocol.ErrProtocolViolation]. On an MQTT 3.1.1 link (no
+// property block) it is always a no-op.
+func validateConnackLimits(v protocol.Version, ack *protocol.ConnackPacket) error {
+	if v != protocol.V50 || ack.Properties == nil {
+		return nil
+	}
+	p := ack.Properties
+	if p.ReceiveMaximum != nil && *p.ReceiveMaximum == 0 {
+		return fmt.Errorf("mqtt/tcp: %w: broker CONNACK Receive Maximum is 0", protocol.ErrProtocolViolation)
+	}
+	if p.MaximumPacketSize != nil && *p.MaximumPacketSize == 0 {
+		return fmt.Errorf("mqtt/tcp: %w: broker CONNACK Maximum Packet Size is 0", protocol.ErrProtocolViolation)
+	}
+	return nil
+}
+
+// buildConnectResult decodes the negotiated session state from the CONNACK,
+// filling in the spec defaults for every limit the broker left unset.
+func (c *TCPClient) buildConnectResult(ack *protocol.ConnackPacket) ConnectResult {
+	res := ConnectResult{
+		SessionPresent:  ack.SessionPresent,
+		ReasonCode:      ack.ReasonCode,
+		ReceiveMaximum:  defaultReceiveMaximum,
+		MaximumQoS:      QoS2,
+		RetainAvailable: true,
+	}
+	p := ack.Properties
+	if p == nil {
+		return res
+	}
+	res.AssignedClientID = p.AssignedClientID
+	if p.ServerKeepAlive != nil {
+		res.ServerKeepAlive = time.Duration(*p.ServerKeepAlive) * time.Second
+	}
+	if p.ReceiveMaximum != nil {
+		res.ReceiveMaximum = *p.ReceiveMaximum
+	}
+	if p.MaximumQoS != nil {
+		res.MaximumQoS = QoS(*p.MaximumQoS)
+	}
+	if p.RetainAvailable != nil {
+		res.RetainAvailable = *p.RetainAvailable != 0
+	}
+	if p.MaximumPacketSize != nil {
+		res.MaximumPacketSize = *p.MaximumPacketSize
+	}
+	if p.TopicAliasMaximum != nil {
+		res.TopicAliasMaximum = *p.TopicAliasMaximum
+	}
+	res.UserProperties = p.UserProperties
+	return res
+}
+
+// effectivePingInterval is the interval between PINGREQs. A broker Server
+// Keep Alive wins even below the client floor (spec §3.2.2.3.15 MUST);
+// otherwise it is half the requested keep-alive. The package-test override
+// takes precedence over both.
+func (c *TCPClient) effectivePingInterval(result ConnectResult) time.Duration {
+	if c.pingInterval > 0 {
+		return c.pingInterval
+	}
+	ka := c.cfg.KeepAlive
+	if result.ServerKeepAlive > 0 {
+		ka = result.ServerKeepAlive
+	}
+	return ka / 2
+}
+
+// reasonStringOf extracts the optional Reason String property, empty when
+// absent.
+func reasonStringOf(p *protocol.Properties) string {
+	if p == nil {
+		return ""
+	}
+	return p.ReasonString
+}
+
+// dial opens the TCP (optionally TLS) connection for u, defaulting the port
+// to 1883 (plain) or 8883 (TLS) when the URL omits it.
+func (c *TCPClient) dial(ctx context.Context, u *url.URL) (net.Conn, error) {
+	host := u.Host
+	tlsScheme := false
+	switch u.Scheme {
+	case "tls", "ssl", "mqtts":
+		tlsScheme = true
+	case "tcp", "mqtt", "":
+	default:
+		return nil, fmt.Errorf("mqtt/tcp: unsupported scheme %q", u.Scheme)
+	}
+	if u.Port() == "" {
+		port := "1883"
+		if tlsScheme {
+			port = "8883"
+		}
+		host = net.JoinHostPort(u.Hostname(), port)
+	}
+
+	dialer := &net.Dialer{}
+	conn, err := dialer.DialContext(ctx, "tcp", host)
+	if err != nil {
+		return nil, err
+	}
+	if !tlsScheme {
+		return conn, nil
+	}
+
+	tlsCfg := c.cfg.TLSConfig
+	if tlsCfg == nil {
+		tlsCfg = &tls.Config{ServerName: u.Hostname(), MinVersion: tls.VersionTLS12}
+	}
+	tlsConn := tls.Client(conn, tlsCfg)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return tlsConn, nil
+}
+
+// isStopping reports whether the link has begun tearing down, so the read
+// and keep-alive loops can suppress warnings for the expected close.
+func isStopping(l *link) bool {
+	select {
+	case <-l.stop:
+		return true
+	default:
+		return false
+	}
+}
