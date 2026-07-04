@@ -124,7 +124,7 @@ e2e-up: e2e-certs ## start the e2e mosquitto + emqx docker containers
 	  eclipse-mosquitto:2
 	docker run -d --name gomqtt-e2e-emqx \
 	  -p 2883:1883 \
-	  emqx/emqx:5
+	  emqx/emqx:5.8
 
 .PHONY: e2e-down
 e2e-down: ## stop and remove the e2e docker containers
