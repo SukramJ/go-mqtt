@@ -132,6 +132,22 @@ e2e-up: e2e-certs ## start the e2e mosquitto + emqx docker containers
 	docker run -d --name gomqtt-e2e-emqx \
 	  -p 2883:1883 \
 	  emqx/emqx:5.8
+# Block until both brokers actually accept MQTT connections. A TCP probe
+# against the mapped host port is NOT a readiness signal: docker-proxy
+# accepts on the host port the instant the container starts and resets
+# the connection until the process inside listens — EMQX takes tens of
+# seconds to boot in CI. The brokers' own log lines are the only honest
+# marker.
+	@for i in $$(seq 1 120); do \
+	  docker logs gomqtt-e2e-mosquitto 2>&1 | grep "mosquitto version .* running" >/dev/null && break; \
+	  [ $$i -eq 120 ] && { echo "mosquitto not ready after 120s"; docker logs gomqtt-e2e-mosquitto; exit 1; }; \
+	  sleep 1; \
+	done; echo "mosquitto ready"
+	@for i in $$(seq 1 120); do \
+	  docker logs gomqtt-e2e-emqx 2>&1 | grep "is running now" >/dev/null && break; \
+	  [ $$i -eq 120 ] && { echo "emqx not ready after 120s"; docker logs gomqtt-e2e-emqx; exit 1; }; \
+	  sleep 1; \
+	done; echo "emqx ready"
 
 .PHONY: e2e-down
 e2e-down: ## stop and remove the e2e docker containers
