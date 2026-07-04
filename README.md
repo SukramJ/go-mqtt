@@ -118,6 +118,34 @@ _ = client311.Publish(context.Background(), "bridge/status", []byte("online"),
 )
 ```
 
+## Circuit breaker
+
+`Breaker` wraps any `Publisher` and fails fast when the broker is up
+but unhealthy — the case the reconnect loop cannot detect. Without it,
+a broker that stops acknowledging turns every QoS >= 1 publish into an
+`AckTimeout`-long stall.
+
+```go
+breaker := mqtt.NewBreaker(client, mqtt.BreakerConfig{
+	FailureThreshold: 5,                // consecutive failures to open
+	RecoveryTimeout:  30 * time.Second, // fail-fast window before probing
+	HalfOpenMax:      1,                // concurrent recovery probes
+	OnStateChange: func(from, to mqtt.BreakerState) {
+		slog.Warn("mqtt breaker", "from", from.String(), "to", to.String())
+	},
+})
+// Publish through the breaker instead of the raw client:
+err := breaker.Publish(ctx, "state/topic", payload, mqtt.QoS1, false)
+if errors.Is(err, mqtt.ErrCircuitOpen) {
+	// broker unhealthy — dropped fast, no AckTimeout stall
+}
+```
+
+Ack timeouts, `ErrConnectionLost`, `ErrNotConnected` and broker
+rejects (`*ReasonError` with an error reason code) count as failures;
+caller-side context cancellation and local limit violations
+(`ErrPacketTooLarge`, `ErrPacketIDExhausted`) are neutral.
+
 ## Testing
 
 ```sh
