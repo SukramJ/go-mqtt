@@ -625,6 +625,31 @@ func (c *TCPClient) addSubscription(filter string, options protocol.SubscribeOpt
 	c.subs = append(c.subs, subscription{filter: filter, handler: handler, options: options})
 }
 
+// snapshotSubscription returns the current registration for filter, if
+// any — the undo state for a provisional [TCPClient.addSubscription]
+// that a failed SUBSCRIBE round-trip must roll back.
+func (c *TCPClient) snapshotSubscription(filter string) (subscription, bool) {
+	c.subsMu.Lock()
+	defer c.subsMu.Unlock()
+	for i := range c.subs {
+		if c.subs[i].filter == filter {
+			return c.subs[i], true
+		}
+	}
+	return subscription{}, false
+}
+
+// restoreSubscription undoes a provisional addSubscription after a failed
+// SUBSCRIBE: it reinstates the previous registration when one existed
+// (in place, preserving order) or removes the entry entirely.
+func (c *TCPClient) restoreSubscription(filter string, prev subscription, existed bool) {
+	if existed {
+		c.addSubscription(prev.filter, prev.options, prev.handler)
+		return
+	}
+	c.removeSubscription(filter)
+}
+
 // removeSubscription drops the registration for filter, if any.
 func (c *TCPClient) removeSubscription(filter string) {
 	c.subsMu.Lock()

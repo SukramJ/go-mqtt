@@ -132,6 +132,15 @@ func (c *TCPClient) Subscribe(ctx context.Context, filter string, qos QoS, handl
 		RetainHandling:    byte(so.retainHandling),
 	}
 
+	// Register the handler BEFORE the SUBSCRIBE hits the wire. The broker
+	// may deliver matching messages — most notably the retained-message
+	// replay — immediately after the SUBACK, often in the same TCP flush.
+	// The read loop dispatches those frames concurrently with this caller,
+	// so a post-SUBACK registration loses that race and the first messages
+	// are silently dropped for want of a handler. Rolled back on failure.
+	prev, replaced := c.snapshotSubscription(filter)
+	c.addSubscription(filter, options, handler)
+
 	res, err := c.requestAck(ctx, l, "SUBSCRIBE", func(id uint16) frameEncoder {
 		return &protocol.SubscribePacket{
 			Version:       c.version,
@@ -140,9 +149,9 @@ func (c *TCPClient) Subscribe(ctx context.Context, filter string, qos QoS, handl
 		}
 	})
 	if err != nil {
+		c.restoreSubscription(filter, prev, replaced)
 		return SubscribeResult{}, err
 	}
-	c.addSubscription(filter, options, handler)
 	return SubscribeResult{GrantedQoS: QoS(res.code), ReasonCode: res.code}, nil
 }
 
