@@ -3,6 +3,21 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Circuit breaker (`Breaker`)** — a drop-in [Publisher] decorator for
+  the degraded-broker case the reconnect loop cannot see: the TCP link
+  is up but the broker stops acknowledging, so every QoS >= 1 publish
+  blocks for the full `AckTimeout`. After `FailureThreshold`
+  consecutive broker-side failures (ack timeouts, connection loss,
+  broker rejects) the circuit opens and publishes fail fast with
+  `ErrCircuitOpen`; after `RecoveryTimeout` a bounded number of probes
+  (`HalfOpenMax`) tests recovery, and one success closes the circuit.
+  Local conditions (caller cancellation, packet-size/ID limits) never
+  trip it. `OnStateChange` exposes transitions for consumer metrics.
+
 ## [1.0.0] - 2026-07-04
 
 Major rewrite: MQTT 5.0 support (now the default protocol), full QoS 2
