@@ -89,6 +89,13 @@ func (l *Lifecycle) OnConnect(fn func(context.Context)) {
 // Start boots the reconnect loop and returns once the first connect
 // has succeeded (or ctx was cancelled). Subsequent drops reconnect
 // in the background.
+//
+// ctx governs the WHOLE reconnect loop, not just the initial connect:
+// cancelling it permanently stops reconnection (without disconnecting
+// an established session — use [Lifecycle.Stop] for an orderly
+// shutdown). Pass a context that lives as long as reconnection should,
+// typically the application's run context — never a short-lived
+// timeout context, or the loop silently dies with it.
 func (l *Lifecycle) Start(ctx context.Context) error {
 	l.mu.Lock()
 	if l.started {

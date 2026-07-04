@@ -36,13 +36,16 @@ func TestLifecycleReconnectAndResubscribe(t *testing.T) {
 		MaxBackoff:     30 * time.Second,
 	}, client)
 
-	startCtx, startCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	err := lc.Start(startCtx)
-	startCancel()
-	if err != nil {
+	// The ctx handed to Start governs the WHOLE reconnect loop, not just
+	// the first connect — cancelling it kills the event-driven reconnect
+	// this test exists to prove. Keep it alive until cleanup.
+	runCtx, cancelRun := context.WithCancel(context.Background())
+	if err := lc.Start(runCtx); err != nil {
+		cancelRun()
 		t.Fatalf("Lifecycle.Start: %v", err)
 	}
 	t.Cleanup(func() {
+		cancelRun()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = lc.Stop(ctx)
