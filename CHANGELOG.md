@@ -204,6 +204,13 @@ Adversarial-review fixes (two rounds, each with regression tests):
   (`MQTT-3.3.2-14`); a wildcarded Response Topic is now rejected
   locally instead of provoking a broker DISCONNECT that tears down the
   whole connection.
+- **Encoding a string containing embedded `U+0000` or ill-formed UTF-8
+  (e.g. a PUBLISH topic) produced wire bytes this codec's own decoder
+  — and any conformant broker — would then reject as a Malformed
+  Packet**, an encode/decode asymmetry `FuzzPublishRoundTrip` caught at
+  the v1.0 final gate. `appendString` now enforces the same §1.5.4
+  well-formedness rules on encode that `readString` already enforced on
+  decode, wrapping `ErrProtocolViolation`.
 
 ## [0.2.0] - 2026-07-03
 

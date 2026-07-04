@@ -221,10 +221,21 @@ func appendVarint(buf *bytes.Buffer, v uint32) {
 
 // appendString appends s to buf as an MQTT UTF-8 string (two-byte length
 // prefix + bytes). It returns [ErrStringTooLong] rather than silently
-// truncating a string longer than 65535 bytes.
+// truncating a string longer than 65535 bytes, and enforces the same
+// §1.5.4 well-formedness rules [readString] checks on decode — well-formed
+// UTF-8 [MQTT-1.5.4-1] and no embedded U+0000 [MQTT-1.5.4-2] — wrapping
+// [ErrProtocolViolation] so encode never silently produces wire bytes this
+// codec's own decoder (or any conformant peer) would then reject as a
+// Malformed Packet.
 func appendString(buf *bytes.Buffer, s string) error {
 	if len(s) > maxStringLen {
 		return fmt.Errorf("%w: %d bytes", ErrStringTooLong, len(s))
+	}
+	if !utf8.ValidString(s) {
+		return fmt.Errorf("%w: string is not well-formed UTF-8", ErrProtocolViolation)
+	}
+	if strings.IndexByte(s, 0) >= 0 {
+		return fmt.Errorf("%w: string contains U+0000", ErrProtocolViolation)
 	}
 	var l [2]byte
 	binary.BigEndian.PutUint16(l[:], uint16(len(s))) //nolint:gosec // len bounded by maxStringLen check above
