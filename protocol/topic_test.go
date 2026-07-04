@@ -33,6 +33,8 @@ func TestMatchTopic(t *testing.T) {
 		{"sport/#", "sport", true},
 		{"+", "x", true},
 		{"+", "x/y", false},
+		{"a/b", "a", false},   // filter has more non-# levels than the topic
+		{"a/b", "a/c", false}, // literal level mismatch
 	}
 
 	for _, tt := range tests {
@@ -87,6 +89,10 @@ func TestValidateTopicFilterLength(t *testing.T) {
 
 	if err := ValidateTopicFilter(strings.Repeat("a", maxTopicLen)); err != nil {
 		t.Errorf("ValidateTopicFilter(max length) = %v, want nil", err)
+	}
+
+	if err := ValidateTopicFilter("not-\xffutf8"); !errors.Is(err, ErrProtocolViolation) {
+		t.Errorf("ValidateTopicFilter(invalid utf8) error = %v, want wrapping ErrProtocolViolation", err)
 	}
 }
 

@@ -6,6 +6,7 @@ package protocol
 import (
 	"bytes"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -108,6 +109,48 @@ func TestEncodeSubscribeEmpty(t *testing.T) {
 	}
 }
 
+// TestEncodeSubscribeIllegalProperty rejects a property illegal for
+// SUBSCRIBE (Assigned Client Identifier is CONNACK-only).
+func TestEncodeSubscribeIllegalProperty(t *testing.T) {
+	t.Parallel()
+	pkt := &SubscribePacket{
+		Version:       V50,
+		PacketID:      1,
+		Subscriptions: []Subscription{{Filter: "a", Options: SubscribeOptions{QoS: 1}}},
+		Properties:    &Properties{AssignedClientID: "x"},
+	}
+	if err := pkt.Encode(&bytes.Buffer{}); !errors.Is(err, ErrProtocolViolation) {
+		t.Fatalf("got %v, want ErrProtocolViolation", err)
+	}
+}
+
+func TestEncodeSubscribeFilterTooLong(t *testing.T) {
+	t.Parallel()
+	pkt := &SubscribePacket{
+		Version:       V50,
+		PacketID:      1,
+		Subscriptions: []Subscription{{Filter: strings.Repeat("x", maxStringLen+1), Options: SubscribeOptions{QoS: 1}}},
+	}
+	if err := pkt.Encode(&bytes.Buffer{}); !errors.Is(err, ErrStringTooLong) {
+		t.Fatalf("got %v, want ErrStringTooLong", err)
+	}
+}
+
+// TestEncodeSubscribeBadQoSThroughEncode drives the subscribeOptionsByte
+// error path via Encode itself (subscribeOptionsByte is exercised directly
+// elsewhere).
+func TestEncodeSubscribeBadQoSThroughEncode(t *testing.T) {
+	t.Parallel()
+	pkt := &SubscribePacket{
+		Version:       V50,
+		PacketID:      1,
+		Subscriptions: []Subscription{{Filter: "a", Options: SubscribeOptions{QoS: 3}}},
+	}
+	if err := pkt.Encode(&bytes.Buffer{}); !errors.Is(err, ErrProtocolViolation) {
+		t.Fatalf("got %v, want ErrProtocolViolation", err)
+	}
+}
+
 func TestEncodeUnsubscribeV3Golden(t *testing.T) {
 	t.Parallel()
 	pkt := &UnsubscribePacket{Version: V311, PacketID: 2, Filters: []string{"a", "b"}}
@@ -149,6 +192,24 @@ func TestEncodeUnsubscribeEmpty(t *testing.T) {
 	pkt := &UnsubscribePacket{Version: V50, PacketID: 1}
 	if err := pkt.Encode(&bytes.Buffer{}); !errors.Is(err, ErrProtocolViolation) {
 		t.Fatalf("got %v, want ErrProtocolViolation", err)
+	}
+}
+
+// TestEncodeUnsubscribeIllegalProperty rejects a property illegal for
+// UNSUBSCRIBE (Assigned Client Identifier is CONNACK-only).
+func TestEncodeUnsubscribeIllegalProperty(t *testing.T) {
+	t.Parallel()
+	pkt := &UnsubscribePacket{Version: V50, PacketID: 1, Filters: []string{"a"}, Properties: &Properties{AssignedClientID: "x"}}
+	if err := pkt.Encode(&bytes.Buffer{}); !errors.Is(err, ErrProtocolViolation) {
+		t.Fatalf("got %v, want ErrProtocolViolation", err)
+	}
+}
+
+func TestEncodeUnsubscribeFilterTooLong(t *testing.T) {
+	t.Parallel()
+	pkt := &UnsubscribePacket{Version: V50, PacketID: 1, Filters: []string{strings.Repeat("x", maxStringLen+1)}}
+	if err := pkt.Encode(&bytes.Buffer{}); !errors.Is(err, ErrStringTooLong) {
+		t.Fatalf("got %v, want ErrStringTooLong", err)
 	}
 }
 
@@ -255,5 +316,12 @@ func TestDecodeUnsubackMalformed(t *testing.T) {
 		if _, err := DecodeUnsuback(tc.v, tc.body); !errors.Is(err, ErrMalformedPacket) {
 			t.Fatalf("%s: got %v, want ErrMalformedPacket", tc.name, err)
 		}
+	}
+}
+
+func TestDecodeUnsubackBadVersion(t *testing.T) {
+	t.Parallel()
+	if _, err := DecodeUnsuback(Version(3), []byte{0x00, 0x01}); !errors.Is(err, ErrProtocolViolation) {
+		t.Fatalf("got %v, want ErrProtocolViolation", err)
 	}
 }

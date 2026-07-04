@@ -6,6 +6,7 @@ package protocol
 import (
 	"bytes"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -154,6 +155,42 @@ func TestEncodeConnectBadVersion(t *testing.T) {
 func TestEncodeConnectIllegalProperty(t *testing.T) {
 	t.Parallel()
 	pkt := &ConnectPacket{Version: V50, ClientID: "c", Properties: &Properties{AssignedClientID: "x"}}
+	if err := pkt.Encode(&bytes.Buffer{}); !errors.Is(err, ErrProtocolViolation) {
+		t.Fatalf("got %v, want ErrProtocolViolation", err)
+	}
+}
+
+// TestEncodeConnectOversizedFields exercises every string/binary field
+// CONNECT.Encode appends: each one, past the 65535-byte wire limit, must
+// surface ErrStringTooLong rather than silently truncating.
+func TestEncodeConnectOversizedFields(t *testing.T) {
+	t.Parallel()
+	big := strings.Repeat("x", maxStringLen+1)
+	cases := map[string]*ConnectPacket{
+		"client id too long":  {Version: V311, ClientID: big},
+		"username too long":   {Version: V311, ClientID: "c", Username: big},
+		"password too long":   {Version: V311, ClientID: "c", Username: "u", Password: big},
+		"will topic too long": {Version: V311, ClientID: "c", Will: &Will{Topic: big}},
+		"will payload too long": {
+			Version: V311, ClientID: "c",
+			Will: &Will{Topic: "t", Payload: make([]byte, maxStringLen+1)},
+		},
+	}
+	for name, pkt := range cases {
+		if err := pkt.Encode(&bytes.Buffer{}); !errors.Is(err, ErrStringTooLong) {
+			t.Fatalf("%s: got %v, want ErrStringTooLong", name, err)
+		}
+	}
+}
+
+// TestEncodeConnectWillPropertiesIllegal rejects a will property illegal in
+// the will-properties context (Assigned Client Identifier is CONNACK-only).
+func TestEncodeConnectWillPropertiesIllegal(t *testing.T) {
+	t.Parallel()
+	pkt := &ConnectPacket{
+		Version: V50, ClientID: "c",
+		Will: &Will{Topic: "t", Properties: &Properties{AssignedClientID: "x"}},
+	}
 	if err := pkt.Encode(&bytes.Buffer{}); !errors.Is(err, ErrProtocolViolation) {
 		t.Fatalf("got %v, want ErrProtocolViolation", err)
 	}

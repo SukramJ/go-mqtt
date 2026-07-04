@@ -72,6 +72,17 @@ func TestEncodeDisconnectV5(t *testing.T) {
 	}
 }
 
+// TestEncodeDisconnectIllegalProperty rejects a property illegal for
+// DISCONNECT (Topic Alias is PUBLISH-only) once the non-empty-body path is
+// taken.
+func TestEncodeDisconnectIllegalProperty(t *testing.T) {
+	t.Parallel()
+	pkt := &DisconnectPacket{Version: V50, ReasonCode: SessionTakenOver, Properties: &Properties{TopicAlias: u16ptr(1)}}
+	if err := pkt.Encode(&bytes.Buffer{}); !errors.Is(err, ErrProtocolViolation) {
+		t.Fatalf("got %v, want ErrProtocolViolation", err)
+	}
+}
+
 func TestEncodeDisconnectBadVersion(t *testing.T) {
 	t.Parallel()
 	if err := (&DisconnectPacket{Version: Version(3)}).Encode(&bytes.Buffer{}); !errors.Is(err, ErrProtocolViolation) {

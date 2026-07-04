@@ -227,14 +227,35 @@ func TestPropertiesTruncatedValue(t *testing.T) {
 		content []byte
 		target  propTarget
 	}{
-		{"byte value missing", []byte{0x24}, tgConnack},
-		{"uint16 truncated", []byte{0x13, 0x00}, tgConnack},
-		{"uint32 truncated", []byte{0x02, 0x00, 0x00, 0x00}, tgPublish},
-		{"string length prefix truncated", []byte{0x03, 0x00}, tgPublish},
-		{"string body overruns", []byte{0x03, 0x00, 0x05, 'a', 'b'}, tgPublish},
-		{"binary body overruns", []byte{0x09, 0x00, 0x04, 0x01}, tgPublish},
-		{"varint subid truncated", []byte{0x0B, 0x80}, tgPublish},
+		{"payload format byte missing", []byte{0x01}, tgPublish},
+		{"message expiry uint32 truncated", []byte{0x02, 0x00, 0x00, 0x00}, tgPublish},
+		{"content type string length prefix truncated", []byte{0x03, 0x00}, tgPublish},
+		{"content type string body overruns", []byte{0x03, 0x00, 0x05, 'a', 'b'}, tgPublish},
+		{"response topic string length prefix truncated", []byte{0x08, 0x00}, tgPublish},
+		{"correlation data binary body overruns", []byte{0x09, 0x00, 0x04, 0x01}, tgPublish},
+		{"subscription identifier varint truncated", []byte{0x0B, 0x80}, tgPublish},
+		{"session expiry uint32 truncated", []byte{0x11, 0x00, 0x00, 0x00}, tgConnect},
+		{"assigned client id string length prefix truncated", []byte{0x12, 0x00}, tgConnack},
+		{"server keep alive uint16 truncated", []byte{0x13, 0x00}, tgConnack},
+		{"auth method string length prefix truncated", []byte{0x15, 0x00}, tgConnect},
+		{"auth data binary length prefix truncated", []byte{0x16, 0x00}, tgConnect},
+		{"request problem info byte missing", []byte{0x17}, tgConnect},
+		{"will delay interval uint32 truncated", []byte{0x18, 0x00, 0x00}, willBit},
+		{"request response info byte missing", []byte{0x19}, tgConnect},
+		{"response info string length prefix truncated", []byte{0x1A, 0x00}, tgConnack},
+		{"server reference string length prefix truncated", []byte{0x1C, 0x00}, tgConnack},
+		{"reason string length prefix truncated", []byte{0x1F, 0x00}, tgConnack},
+		{"receive maximum uint16 truncated", []byte{0x21, 0x00}, tgConnect},
+		{"topic alias maximum uint16 truncated", []byte{0x22, 0x00}, tgConnect},
+		{"topic alias uint16 truncated", []byte{0x23, 0x00}, tgPublish},
+		{"maximum qos byte missing", []byte{0x24}, tgConnack},
+		{"retain available byte missing", []byte{0x25}, tgConnack},
+		{"user property key missing", []byte{0x26}, tgPublish},
 		{"user property value missing", []byte{0x26, 0x00, 0x01, 'a'}, tgPublish},
+		{"maximum packet size uint32 truncated", []byte{0x27, 0x00, 0x00}, tgConnect},
+		{"wildcard sub available byte missing", []byte{0x28}, tgConnack},
+		{"sub id available byte missing", []byte{0x29}, tgConnack},
+		{"shared sub available byte missing", []byte{0x2A}, tgConnack},
 	}
 	for _, tc := range cases {
 		block := propBlock(tc.content)
@@ -294,5 +315,35 @@ func TestPropertiesEncodeStringTooLong(t *testing.T) {
 	var buf bytes.Buffer
 	if err := p.encode(&buf, tgPublish); !errors.Is(err, ErrStringTooLong) {
 		t.Fatalf("got %v, want ErrStringTooLong", err)
+	}
+}
+
+// TestPropertiesUserPropertyDisallowedTarget drives checkEncodeAllowed's
+// failure path for User Property (0x26) itself: every real packet target
+// admits it (see userPropTargets), so only an artificial zero target can
+// exercise the rejection.
+func TestPropertiesUserPropertyDisallowedTarget(t *testing.T) {
+	t.Parallel()
+	p := &Properties{UserProperties: []UserProperty{{Key: "k", Value: "v"}}}
+	var buf bytes.Buffer
+	if err := p.encode(&buf, propTarget(0)); !errors.Is(err, ErrProtocolViolation) {
+		t.Fatalf("got %v, want ErrProtocolViolation", err)
+	}
+}
+
+// TestPropertiesUserPropertyFieldsTooLong exercises the length guard on
+// both halves of a User Property pair independently.
+func TestPropertiesUserPropertyFieldsTooLong(t *testing.T) {
+	t.Parallel()
+	big := strings.Repeat("x", maxStringLen+1)
+	cases := map[string]*Properties{
+		"key too long":   {UserProperties: []UserProperty{{Key: big, Value: "v"}}},
+		"value too long": {UserProperties: []UserProperty{{Key: "k", Value: big}}},
+	}
+	for name, p := range cases {
+		var buf bytes.Buffer
+		if err := p.encode(&buf, tgPublish); !errors.Is(err, ErrStringTooLong) {
+			t.Fatalf("%s: got %v, want ErrStringTooLong", name, err)
+		}
 	}
 }

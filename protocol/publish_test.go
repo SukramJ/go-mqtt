@@ -6,6 +6,7 @@ package protocol
 import (
 	"bytes"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -181,6 +182,16 @@ func TestEncodePublishErrors(t *testing.T) {
 	}
 }
 
+// TestEncodePublishTopicTooLong exercises the topic-length guard PUBLISH
+// shares with every other appendString call site.
+func TestEncodePublishTopicTooLong(t *testing.T) {
+	t.Parallel()
+	pkt := &PublishPacket{Version: V311, Topic: strings.Repeat("x", maxStringLen+1)}
+	if err := pkt.Encode(&bytes.Buffer{}); !errors.Is(err, ErrStringTooLong) {
+		t.Fatalf("got %v, want ErrStringTooLong", err)
+	}
+}
+
 func TestDecodePublishMalformed(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -292,6 +303,23 @@ func TestEncodeAckBadType(t *testing.T) {
 	t.Parallel()
 	pkt := &AckPacket{Version: V50, Type: Publish, PacketID: 1}
 	if err := pkt.EncodeAck(&bytes.Buffer{}); !errors.Is(err, ErrProtocolViolation) {
+		t.Fatalf("got %v, want ErrProtocolViolation", err)
+	}
+}
+
+// TestEncodeAckIllegalProperty rejects a property illegal for the
+// acknowledgement's target (Assigned Client Identifier is CONNACK-only).
+func TestEncodeAckIllegalProperty(t *testing.T) {
+	t.Parallel()
+	pkt := &AckPacket{Version: V50, Type: Puback, PacketID: 1, Properties: &Properties{AssignedClientID: "x"}}
+	if err := pkt.EncodeAck(&bytes.Buffer{}); !errors.Is(err, ErrProtocolViolation) {
+		t.Fatalf("got %v, want ErrProtocolViolation", err)
+	}
+}
+
+func TestDecodeAckBadVersion(t *testing.T) {
+	t.Parallel()
+	if _, err := DecodeAck(Version(3), Puback, []byte{0x00, 0x01}); !errors.Is(err, ErrProtocolViolation) {
 		t.Fatalf("got %v, want ErrProtocolViolation", err)
 	}
 }

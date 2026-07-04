@@ -167,6 +167,17 @@ func TestReadFrameBodyReadError(t *testing.T) {
 	}
 }
 
+func TestReadFrameLengthReadError(t *testing.T) {
+	t.Parallel()
+	// Fixed header 0x30 (PUBLISH) reads fine, then the remaining-length
+	// varint read fails because the reader has nothing more to give.
+	r := &errReader{header: []byte{0x30}}
+	_, err := ReadFrame(r, 1<<20)
+	if err == nil {
+		t.Fatal("expected error when remaining-length read fails")
+	}
+}
+
 func TestReadFrameRejectsOversizedBeforeAlloc(t *testing.T) {
 	t.Parallel()
 	const limit = 1 << 20
@@ -423,11 +434,19 @@ func TestPacketTypeString(t *testing.T) {
 	t.Parallel()
 	cases := map[PacketType]string{
 		Connect:     "CONNECT",
+		Connack:     "CONNACK",
 		Publish:     "PUBLISH",
+		Puback:      "PUBACK",
 		Pubrec:      "PUBREC",
 		Pubrel:      "PUBREL",
 		Pubcomp:     "PUBCOMP",
+		Subscribe:   "SUBSCRIBE",
+		Suback:      "SUBACK",
 		Unsubscribe: "UNSUBSCRIBE",
+		Unsuback:    "UNSUBACK",
+		Pingreq:     "PINGREQ",
+		Pingresp:    "PINGRESP",
+		Disconnect:  "DISCONNECT",
 		Auth:        "AUTH",
 	}
 	for pt, want := range cases {
