@@ -1,9 +1,12 @@
 # GitHub Actions CI for go-mqtt.
 #
-# Two jobs: lint (go vet + gofumpt + golangci-lint), test (race
-# detector across the OS triplet consumers build on). Concurrency
-# cancels stale runs on the same ref so a fast-pushing developer isn't
-# billed for outdated commits.
+# Jobs: lint (go vet + gofumpt + golangci-lint), test (race detector
+# across the OS triplet consumers build on), fuzz-smoke (10s per Fuzz
+# target in ./protocol — a cheap regression net between the periodic
+# longer `make fuzz` runs), e2e (docker-composed mosquitto + emqx
+# brokers exercised by ./e2e). Concurrency cancels stale runs on the
+# same ref so a fast-pushing developer isn't billed for outdated
+# commits.
 name: ci
 
 on:
@@ -66,3 +69,58 @@ jobs:
           # Race detector requires CGo; enable just for this step.
           CGO_ENABLED: "1"
         run: go test -race -count=1 -timeout=120s ./...
+
+  fuzz-smoke:
+    name: fuzz-smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: actions/setup-go@v6.5.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: fuzz smoke (10s per ./protocol Fuzz target)
+        run: make fuzz-smoke
+
+  e2e:
+    name: e2e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.0
+      - uses: actions/setup-go@v6.5.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: start e2e brokers (mosquitto + emqx)
+        run: make e2e-up
+      - name: wait for broker ports
+        shell: bash
+        run: |
+          ports="1883 8883 1884 2883"
+          budget=90
+          deadline=$((SECONDS + budget))
+          for port in $ports; do
+            until (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                echo "::error::timed out after ${budget}s waiting for 127.0.0.1:$port"
+                exit 1
+              fi
+              sleep 1
+            done
+            exec 3<&- 3>&- || true
+            echo "127.0.0.1:$port is up"
+          done
+      - name: run e2e tests
+        env:
+          MQTT_E2E_ALLOW_DOCKER_CONTROL: "1"
+        run: make test-e2e
+      - name: dump broker logs
+        if: always()
+        run: |
+          echo "== gomqtt-e2e-mosquitto logs =="
+          docker logs gomqtt-e2e-mosquitto || true
+          echo "== gomqtt-e2e-emqx logs =="
+          docker logs gomqtt-e2e-emqx || true
+      - name: stop e2e brokers
+        if: always()
+        run: make e2e-down
