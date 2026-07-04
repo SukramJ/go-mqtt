@@ -1,36 +1,209 @@
-#!/usr/bin/env sh
+#!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 SukramJ
 #
-# Pre-commit hook: refuse direct commits on protected branches.
+# pre-commit — runs format + build + vet + lint + fast tests against the
+# staged Go changes. Wired up by `make setup` / `make hooks` via
+# `git config core.hooksPath .githooks`. Ported from openccu-loom's hook
+# and adapted to this library (no contract suite; e2e tests skip
+# themselves without a broker).
 #
-# Work on a feature branch and open a pull request instead. Merges
-# (git merge / git pull) are unaffected — they use the pre-merge-commit
-# hook, not this one — so updating main from the remote still works.
+# Goals:
+#   - Auto-format with gofumpt + goimports and re-stage the affected files
+#     so commits never carry style noise.
+#   - Catch the most common breakages early without being so slow that
+#     developers start passing --no-verify.
+#   - Skip the heavy stuff (race detector, full matrix, real-broker e2e) —
+#     CI runs those separately. The hook stays fast on a warm build cache.
 #
-# Deliberate one-off override:
-#     ALLOW_MAIN_COMMIT=1 git commit ...
-#   or bypass every hook with:
-#     git commit --no-verify
+# Skip / override:
+#   GOMQTT_PRECOMMIT_SKIP=1           skip the entire hook
+#   GOMQTT_PRECOMMIT_SKIP_TESTS=1     skip the test stage
+#   GOMQTT_PRECOMMIT_SKIP_LINT=1      skip golangci-lint
+#   GOMQTT_PRECOMMIT_ALLOW_MAIN=1     allow a commit on main/master
+#   ALLOW_MAIN_COMMIT=1               same, kept from the previous hook
+#   git commit --no-verify            standard escape hatch
 #
-# Enable for your clone (also wired into `make setup` / `make hooks`):
-#     git config core.hooksPath .githooks
+# Output is colourised when stderr is a TTY.
 
-protected="main master"
+set -euo pipefail
 
-branch="$(git symbolic-ref --short -q HEAD)" || branch=""
+if [[ "${GOMQTT_PRECOMMIT_SKIP:-0}" == "1" ]]; then
+    echo "pre-commit: GOMQTT_PRECOMMIT_SKIP=1, skipping all checks" >&2
+    exit 0
+fi
 
-for p in $protected; do
-	if [ "$branch" = "$p" ]; then
-		if [ "${ALLOW_MAIN_COMMIT:-0}" = "1" ]; then
-			exit 0
-		fi
-		printf '\033[31m✗ Direct commits to "%s" are blocked.\033[0m\n' "$branch" >&2
-		printf '  Create a feature branch and open a PR:\n' >&2
-		printf '      git switch -c feature/my-change\n' >&2
-		printf '  Override once: ALLOW_MAIN_COMMIT=1 git commit ...   (or --no-verify)\n' >&2
-		exit 1
-	fi
-done
+# ---------------------------------------------------------------------------
+# Colour helpers — quiet when stderr is redirected.
+# ---------------------------------------------------------------------------
+if [[ -t 2 ]]; then
+    C_RED=$'\e[0;31m'; C_GRN=$'\e[0;32m'; C_YLW=$'\e[0;33m'
+    C_CYN=$'\e[0;36m'; C_DIM=$'\e[0;90m'; C_RST=$'\e[0m'
+else
+    C_RED=""; C_GRN=""; C_YLW=""; C_CYN=""; C_DIM=""; C_RST=""
+fi
 
+step()  { printf "%s» %s%s\n" "$C_CYN" "$1" "$C_RST" >&2; }
+ok()    { printf "%s  ✓ %s%s\n" "$C_GRN" "$1" "$C_RST" >&2; }
+warn()  { printf "%s  ! %s%s\n" "$C_YLW" "$1" "$C_RST" >&2; }
+fail()  { printf "%s  ✗ %s%s\n" "$C_RED" "$1" "$C_RST" >&2; }
+note()  { printf "%s    %s%s\n" "$C_DIM" "$1" "$C_RST" >&2; }
+
+# ---------------------------------------------------------------------------
+# Tool resolution — prefer GOPATH/bin, fall back to PATH.
+# ---------------------------------------------------------------------------
+GOBIN="$(go env GOPATH 2>/dev/null)/bin"
+PATH="${GOBIN}:${PATH}"
+export PATH
+
+GOFUMPT_BIN="${GOFUMPT:-gofumpt}"
+GOIMPORTS_BIN="${GOIMPORTS:-goimports}"
+GOLANGCI_BIN="${GOLANGCI_LINT:-golangci-lint}"
+MODULE_PATH="$(awk '/^module /{print $2; exit}' go.mod)"
+
+require_bin() {
+    if ! command -v "$1" >/dev/null 2>&1; then
+        fail "$1 not found on PATH (PATH=$PATH)"
+        note "install with: make setup"
+        exit 1
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Stage 0a — branch guard. main/master are protected (CLAUDE.md: no
+# direct commits to main); every change lands through a feature branch +
+# PR. Detached HEAD (rebase/cherry-pick in progress) is deliberately
+# allowed — those commits replay onto a branch afterwards.
+# ---------------------------------------------------------------------------
+current_branch="$(git symbolic-ref --quiet --short HEAD || true)"
+if [[ "$current_branch" == "main" || "$current_branch" == "master" ]]; then
+    if [[ "${GOMQTT_PRECOMMIT_ALLOW_MAIN:-0}" != "1" && "${ALLOW_MAIN_COMMIT:-0}" != "1" ]]; then
+        fail "commit on '$current_branch' blocked — it only moves through merged PRs"
+        note "create a branch first:  git switch -c feature/<desc>"
+        note "override once (maintainer): GOMQTT_PRECOMMIT_ALLOW_MAIN=1 git commit ..."
+        exit 1
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 0 — collect staged Go files.
+# ---------------------------------------------------------------------------
+mapfile -t STAGED_GO < <(git diff --cached --name-only --diff-filter=ACMR -- '*.go' 2>/dev/null || true)
+
+if [[ ${#STAGED_GO[@]} -eq 0 ]]; then
+    note "no staged Go files; skipping format/lint/test stages"
+    NO_GO=1
+else
+    NO_GO=0
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 1 — format (gofumpt + goimports). Re-stages mutated files so the
+# commit contains the formatted versions instead of failing the user.
+# ---------------------------------------------------------------------------
+if [[ $NO_GO -eq 0 ]]; then
+    step "gofumpt + goimports"
+    require_bin "$GOFUMPT_BIN"
+    require_bin "$GOIMPORTS_BIN"
+
+    formatted=()
+    for f in "${STAGED_GO[@]}"; do
+        [[ -f "$f" ]] || continue
+        before_hash="$(git hash-object "$f")"
+        "$GOFUMPT_BIN" -w "$f"
+        "$GOIMPORTS_BIN" -w -local "$MODULE_PATH" "$f"
+        after_hash="$(git hash-object "$f")"
+        if [[ "$before_hash" != "$after_hash" ]]; then
+            formatted+=("$f")
+        fi
+    done
+
+    if [[ ${#formatted[@]} -gt 0 ]]; then
+        warn "auto-formatted ${#formatted[@]} file(s); re-staging"
+        for f in "${formatted[@]}"; do
+            note "$f"
+            git add -- "$f"
+        done
+    else
+        ok "all staged files already gofumpt-clean"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 2 — go vet (covers obvious mistakes, very fast).
+# ---------------------------------------------------------------------------
+if [[ $NO_GO -eq 0 ]]; then
+    step "go vet ./..."
+    if ! go vet ./... 2>&1 | sed 's/^/    /' >&2; then
+        fail "go vet failed; fix the issues above before committing"
+        exit 1
+    fi
+    ok "go vet clean"
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 3 — go build (ensures the tree compiles, including test packages).
+# ---------------------------------------------------------------------------
+if [[ $NO_GO -eq 0 ]]; then
+    step "go build ./..."
+    if ! go build ./... 2>&1 | sed 's/^/    /' >&2; then
+        fail "go build failed"
+        exit 1
+    fi
+    ok "build clean"
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 4 — golangci-lint on new issues only (fast incremental mode).
+# Skippable via GOMQTT_PRECOMMIT_SKIP_LINT=1 for tight inner loops.
+# ---------------------------------------------------------------------------
+if [[ "${GOMQTT_PRECOMMIT_SKIP_LINT:-0}" == "1" ]]; then
+    warn "lint skipped via GOMQTT_PRECOMMIT_SKIP_LINT=1"
+elif [[ $NO_GO -eq 0 ]]; then
+    step "golangci-lint (incremental, --new-from-rev=HEAD)"
+    if ! command -v "$GOLANGCI_BIN" >/dev/null 2>&1; then
+        warn "$GOLANGCI_BIN not installed; skipping lint stage"
+        note "install with: make setup"
+    else
+        # --new-from-rev=HEAD restricts to issues introduced by the
+        # currently staged change, keeping the hook fast while still
+        # blocking new violations.
+        if ! "$GOLANGCI_BIN" run --new-from-rev=HEAD --timeout=120s ./... 2>&1 | sed 's/^/    /' >&2; then
+            fail "golangci-lint reported issues; fix before committing"
+            note "to skip once: GOMQTT_PRECOMMIT_SKIP_LINT=1 git commit ..."
+            exit 1
+        fi
+        ok "lint clean (incremental scope)"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Stage 5 — fast tests on the packages touched by the staged change
+# (no race detector — CI owns that; e2e tests self-skip without a
+# broker). Skippable via GOMQTT_PRECOMMIT_SKIP_TESTS=1.
+# ---------------------------------------------------------------------------
+if [[ "${GOMQTT_PRECOMMIT_SKIP_TESTS:-0}" == "1" ]]; then
+    warn "tests skipped via GOMQTT_PRECOMMIT_SKIP_TESTS=1"
+elif [[ $NO_GO -eq 0 ]]; then
+    # Map each staged .go file to its package directory, deduplicated.
+    declare -A pkg_set=()
+    for f in "${STAGED_GO[@]}"; do
+        d="$(dirname -- "$f")"
+        if [[ "$d" == "." ]]; then
+            pkg_set["."]=1
+        else
+            pkg_set["./$d/..."]=1
+        fi
+    done
+    mapfile -t pkgs < <(printf '%s\n' "${!pkg_set[@]}" | sort)
+    step "go test ${pkgs[*]} (count=1, timeout=120s)"
+    if ! go test -count=1 -timeout=120s "${pkgs[@]}" 2>&1 | tail -40 | sed 's/^/    /' >&2; then
+        fail "tests failed"
+        note "to skip once: GOMQTT_PRECOMMIT_SKIP_TESTS=1 git commit ..."
+        exit 1
+    fi
+    ok "tests green"
+fi
+
+ok "pre-commit: all checks passed"
 exit 0

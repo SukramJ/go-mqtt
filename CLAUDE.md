@@ -79,7 +79,7 @@ protocol/fuzz_test.go    native go test Fuzz targets (FuzzReadFrame, FuzzDecodeP
 e2e/                     env-gated scenario tests against real mosquitto + EMQX brokers over Docker; no build tag (always compiled)
 e2e/gencert/             standalone `go run` program generating the e2e CA + server TLS cert
 *_test.go                colocated tests (root + protocol), incl. review_round*_test.go (adversarial-review regressions)
-.github/workflows/       ci.yml (lint, test matrix, fuzz-smoke, e2e), codeql.yml, dependabot-auto-merge.yml
+.github/workflows/       ci.yml (lint, test matrix, fuzz-smoke, e2e), codeql.yml, release-on-tag.yml, dependabot-auto-merge.yml
 .githooks/               pre-commit hook blocking direct commits on main/master
 ```
 
@@ -303,11 +303,14 @@ Run a single package's tests directly, e.g. `go test ./protocol/...`.
   gofumpt check + golangci-lint), `test` (matrix across
   ubuntu/macos/windows with the race detector), `fuzz-smoke` (10s per
   `./protocol` Fuzz target, ubuntu), `e2e` (ubuntu-only — macOS/Windows
-  runners have no Docker — starts mosquitto + EMQX via `docker run`,
-  waits for their ports, runs `make test-e2e`, dumps container logs on
-  failure). A separate `codeql.yml` runs CodeQL SAST on push/PR/weekly
-  schedule; `dependabot-auto-merge.yml` auto-merges non-major
-  Dependabot PRs.
+  runners have no Docker — starts mosquitto + EMQX via `make e2e-up`,
+  which blocks until both brokers log readiness, runs `make test-e2e`,
+  dumps container logs on failure). A separate `codeql.yml` runs CodeQL
+  SAST on push/PR/weekly schedule; `dependabot-auto-merge.yml`
+  auto-merges non-major Dependabot PRs; `release-on-tag.yml` creates a
+  GitHub Release for every pushed tag with the matching `CHANGELOG.md`
+  section as its body (and fails if that section is missing) — a
+  library release ships notes only, no binaries.
 
 ## Non-Goals (v1.0)
 

@@ -1,0 +1,66 @@
+name: "Release: Create from Tag"
+# yamllint disable-line rule:truthy
+on:
+  push:
+    tags:
+      - '**'
+
+permissions:
+  contents: write
+
+# One concurrent release per tag — re-pushing the same tag overrides
+# the previous in-flight run instead of racing it.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  create_release:
+    if: github.repository_owner == 'SukramJ'
+    name: Create GitHub Release (${{ github.ref_name }})
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          # Fetch full history so git-describe can resolve the tag.
+          fetch-depth: 0
+
+      - name: Determine version from tag
+        run: |
+          TAG_NAME="${GITHUB_REF_NAME}"
+          # Strip a leading 'v' to map tags like v1.2.3 -> 1.2.3
+          VERSION="${TAG_NAME#v}"
+          echo "TAG_NAME=${TAG_NAME}" >> "$GITHUB_ENV"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "Tag: $TAG_NAME -> $VERSION"
+
+      # go-mqtt is a library: a release carries no binaries or archives
+      # (unlike the go-*2mqtt daemons this workflow is modelled on). The
+      # release body is the matching CHANGELOG.md section — extraction
+      # fails loudly when the section is missing, so a tag cannot ship
+      # without release notes.
+      - name: Extract release notes from CHANGELOG.md
+        run: |
+          awk -v ver="${VERSION}" '
+            $0 ~ "^## \\[" ver "\\]" { found = 1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if ! grep -q '[^[:space:]]' RELEASE_NOTES.md; then
+            echo "::error::CHANGELOG.md has no section for version ${VERSION}"
+            exit 1
+          fi
+          echo "== RELEASE_NOTES.md =="
+          cat RELEASE_NOTES.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b  # v3
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          name: ${{ env.TAG_NAME }}
+          body_path: RELEASE_NOTES.md
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
