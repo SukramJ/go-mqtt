@@ -90,8 +90,15 @@ func (c *TCPClient) handleFrame(l *link, frame protocol.Frame) bool {
 func (c *TCPClient) handlePublish(l *link, frame protocol.Frame) bool {
 	pub, err := protocol.DecodePublish(c.version, frame.Header, frame.Body)
 	if err != nil {
+		// A Malformed Packet is fatal (§4.13.1): close the connection with
+		// reason 0x81 rather than logging and reading on. Swallowing it would
+		// leave a QoS 1/2 malformed PUBLISH unacknowledged (its packet id was
+		// never decoded), so a broker that keeps it unacked retransmits it
+		// forever — a warn-log livelock instead of a clean teardown. This
+		// mirrors the topic-alias-violation path below.
 		c.logger.Warn("mqtt.tcp.malformed_publish", slog.String("err", err.Error()))
-		return true
+		c.protocolError(l, protocol.MalformedPacketReason)
+		return false
 	}
 
 	topic, ok := c.resolveTopicAlias(l, pub)
@@ -192,9 +199,13 @@ func (c *TCPClient) handleAck(l *link, frame protocol.Frame, t protocol.PacketTy
 }
 
 // completeOutbound finalises a terminal outbound QoS>0 exchange: it drops
-// the stored entry, frees the identifier and signals the waiter. When the
-// entry is absent the acknowledgement is unknown (warn); when present but
-// unwaited it is a resumed-session completion (debug).
+// the stored entry, frees the identifier, releases the send-quota permit the
+// in-flight message held, and signals the waiter. When the entry is absent
+// the acknowledgement is unknown (warn); when present but unwaited it is a
+// resumed-session completion (debug) — in which case the permit released
+// here is the one the original publishAcked goroutine intentionally left
+// held when the send outlived its caller (ctx cancel / ack timeout / a
+// connection drop that resumed the session).
 func (c *TCPClient) completeOutbound(id uint16, kind StoredKind, res ackResult) {
 	if !c.storeContains(id, kind) {
 		c.logger.Warn("mqtt.tcp.ack_unknown_id",
@@ -203,6 +214,7 @@ func (c *TCPClient) completeOutbound(id uint16, kind StoredKind, res ackResult) 
 	}
 	_ = c.store.Delete(id, kind)
 	c.ids.Release(id)
+	c.quota.release()
 	if !c.signalWaiter(id, res) {
 		c.logger.Debug("mqtt.tcp.ack_replayed", slog.Uint64("packet_id", uint64(id)))
 	}
@@ -217,13 +229,19 @@ func (c *TCPClient) handlePubrec(l *link, ack *protocol.AckPacket, reason string
 	id := ack.PacketID
 	if c.storeContains(id, StoredPublish) {
 		if ack.ReasonCode.IsError() {
+			// Terminal abort of the exchange: drop the stored PUBLISH, free
+			// the id and release the send-quota permit it held.
 			_ = c.store.Delete(id, StoredPublish)
 			c.ids.Release(id)
+			c.quota.release()
 			if !c.signalWaiter(id, ackResult{code: ack.ReasonCode, reason: reason}) {
 				c.logger.Debug("mqtt.tcp.pubrec_error_replayed", slog.Uint64("packet_id", uint64(id)))
 			}
 			return
 		}
+		// Success: the PUBLISH is superseded by its PUBREL leg. The permit is
+		// NOT released here — it carries over to the StoredPubrel and is freed
+		// only when the terminal PUBCOMP arrives (completeOutbound).
 		_ = c.store.Save(StoredMessage{ID: id, Kind: StoredPubrel})
 		_ = c.store.Delete(id, StoredPublish)
 		c.sendAck(l, protocol.Pubrel, id)
@@ -301,8 +319,15 @@ func (c *TCPClient) sendAck(l *link, t protocol.PacketType, id uint16) {
 	}
 }
 
-// storeContains reports whether an entry for (id, kind) is present.
+// storeContains reports whether an entry for (id, kind) is present. It runs
+// on the read-loop hot path (once per inbound ack and QoS 2 PUBLISH), so it
+// prefers a store's O(1) [containsStore.Contains] over the O(n log n)
+// snapshot-and-sort of [SessionStore.All]; a store that does not implement
+// the fast path falls back to a linear scan.
 func (c *TCPClient) storeContains(id uint16, kind StoredKind) bool {
+	if cs, ok := c.store.(containsStore); ok {
+		return cs.Contains(id, kind)
+	}
 	msgs, err := c.store.All()
 	if err != nil {
 		return false

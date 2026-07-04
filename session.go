@@ -94,6 +94,16 @@ type storeKey struct {
 	kind StoredKind
 }
 
+// containsStore is the optional fast-membership extension a [SessionStore]
+// may implement so a presence check avoids the O(n log n) snapshot-and-sort
+// of [SessionStore.All]. The client type-asserts for it on the hot read
+// loop (every inbound ack and QoS 2 PUBLISH tests membership) and falls back
+// to All when a store does not provide it. It is deliberately unexported and
+// additive: it does not widen the frozen [SessionStore] contract.
+type containsStore interface {
+	Contains(id uint16, kind StoredKind) bool
+}
+
 // memStore is the default in-memory [SessionStore]: a mutex-guarded map
 // with a monotonic sequence counter. It is constructor-internal in v1.0;
 // there is no configuration hook to substitute a persistent store yet.
@@ -103,7 +113,10 @@ type memStore struct {
 	seq  uint64
 }
 
-var _ SessionStore = (*memStore)(nil)
+var (
+	_ SessionStore  = (*memStore)(nil)
+	_ containsStore = (*memStore)(nil)
+)
 
 // newMemStore returns an empty in-memory session store.
 func newMemStore() *memStore {
@@ -131,6 +144,15 @@ func (s *memStore) Delete(id uint16, kind StoredKind) error {
 	delete(s.msgs, storeKey{id: id, kind: kind})
 	s.mu.Unlock()
 	return nil
+}
+
+// Contains implements [containsStore]: an O(1) membership test used on the
+// read-loop hot path instead of a full [memStore.All] snapshot-and-sort.
+func (s *memStore) Contains(id uint16, kind StoredKind) bool {
+	s.mu.Lock()
+	_, ok := s.msgs[storeKey{id: id, kind: kind}]
+	s.mu.Unlock()
+	return ok
 }
 
 // All implements [SessionStore].
@@ -273,15 +295,21 @@ func (q *quota) release() {
 	q.mu.Unlock()
 }
 
-// reset sets the permit ceiling to n and clears any failed state, then
-// wakes all waiters. It is an absolute reset used on (re)connect: permits
-// already checked out by in-flight sends are NOT subtracted from n. When n
-// shrinks below the number of outstanding permits, those outstanding
-// sends still call release() and will push avail above the new ceiling
-// until they drain, so the smaller ceiling only takes full effect once the
-// pre-reset in-flight sends complete. Callers therefore reset only while
-// no send holds a permit (connection re-established, waiters already
-// failed) so this transient over-commit cannot occur.
+// reset sets the number of currently-available permits to n and clears any
+// failed state, then wakes all waiters. It is an absolute set, not an
+// increment: n is the free-slot count the caller wants after the reset, and
+// any permits notionally held by still-in-flight sends have already been
+// subtracted by the caller.
+//
+// The client resets on (re)connect and passes n = Receive Maximum minus the
+// number of QoS>0 messages still in flight (the resumed-session replay set),
+// so those replayed PUBLISHes stay accounted for against Receive Maximum;
+// each releases its permit only when its terminal ack arrives on the new
+// connection. Because the release of an in-flight permit is driven by the
+// new connection's read loop — which has not started when reset runs — and
+// the previous connection's parked sends were already unblocked by fail()
+// without releasing (their messages survive for replay), no release races
+// this reset and avail never transiently exceeds the ceiling.
 func (q *quota) reset(n int) {
 	q.mu.Lock()
 	q.avail = n

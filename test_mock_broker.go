@@ -823,8 +823,9 @@ func (b *mockBroker) SetSessionPresent(v bool) { b.sessionPresent.Store(v) }
 
 // SetConnackProperties sets the MQTT 5.0 CONNACK properties (a subset:
 // ReceiveMaximum, ServerKeepAlive, AssignedClientID, TopicAliasMaximum,
-// MaximumPacketSize) attached to every subsequent v5 CONNACK. Pass nil to
-// stop attaching any. Ignored on an MQTT 3.1.1 link.
+// MaximumPacketSize, MaximumQoS, RetainAvailable) attached to every
+// subsequent v5 CONNACK. Pass nil to stop attaching any. Ignored on an MQTT
+// 3.1.1 link.
 func (b *mockBroker) SetConnackProperties(p *protocol.Properties) { b.connackProps.Store(p) }
 
 // buildConnack assembles the CONNACK body for protocol version v.
@@ -868,6 +869,14 @@ func appendMockConnackProps(body *bytes.Buffer, p *protocol.Properties) {
 		if p.TopicAliasMaximum != nil {
 			props.WriteByte(0x22)
 			writeMockU16(&props, *p.TopicAliasMaximum)
+		}
+		if p.MaximumQoS != nil {
+			props.WriteByte(0x24)
+			props.WriteByte(*p.MaximumQoS)
+		}
+		if p.RetainAvailable != nil {
+			props.WriteByte(0x25)
+			props.WriteByte(*p.RetainAvailable)
 		}
 		if p.MaximumPacketSize != nil {
 			props.WriteByte(0x27)

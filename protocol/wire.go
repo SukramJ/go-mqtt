@@ -8,6 +8,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"strings"
+	"unicode/utf8"
 )
 
 // PacketType is the MQTT control packet type: the high nibble of the
@@ -307,7 +309,12 @@ func (c *cursor) readVarint() (uint32, error) {
 	return 0, wrapMalformed("variable byte integer too long")
 }
 
-// readString reads a two-byte-prefixed MQTT UTF-8 string.
+// readString reads a two-byte-prefixed MQTT UTF-8 string and enforces the
+// well-formedness rules every MQTT UTF-8 encoded string must satisfy
+// (§1.5.4): the bytes MUST be well-formed UTF-8 [MQTT-1.5.4-1] and MUST NOT
+// contain U+0000 [MQTT-1.5.4-2]. A receiver treats a violation as a
+// Malformed Packet (§4.13), so both are surfaced wrapping
+// [ErrMalformedPacket] rather than handed on as a corrupt topic/property.
 func (c *cursor) readString() (string, error) {
 	n, err := c.readUint16()
 	if err != nil {
@@ -318,6 +325,12 @@ func (c *cursor) readString() (string, error) {
 	}
 	s := string(c.buf[c.pos : c.pos+int(n)])
 	c.pos += int(n)
+	if !utf8.ValidString(s) {
+		return "", wrapMalformed("string is not well-formed UTF-8")
+	}
+	if strings.IndexByte(s, 0) >= 0 {
+		return "", wrapMalformed("string contains U+0000")
+	}
 	return s, nil
 }
 

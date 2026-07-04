@@ -35,6 +35,22 @@ func (c *TCPClient) Publish(ctx context.Context, topic string, payload []byte, q
 		return ErrNotConnected
 	}
 
+	// Honour the broker's advertised limits locally rather than transmitting
+	// a PUBLISH the broker will reject with a DISCONNECT: a QoS above the
+	// negotiated Maximum QoS violates [MQTT-3.2.2-11] (broker replies 0x9B),
+	// and a retained PUBLISH when Retain Available = 0 violates
+	// [MQTT-3.2.2-14] (broker replies 0x9A). On an MQTT 3.1.1 link (and any
+	// broker that advertised neither) these default to QoS 2 / retain-on, so
+	// the checks are no-ops.
+	if res, ok := c.ConnectResult(); ok {
+		if qos > res.MaximumQoS {
+			return fmt.Errorf("%w: QoS %d exceeds the broker's Maximum QoS %d", protocol.ErrProtocolViolation, qos, res.MaximumQoS)
+		}
+		if retain && !res.RetainAvailable {
+			return fmt.Errorf("%w: broker does not support retained messages", protocol.ErrProtocolViolation)
+		}
+	}
+
 	var po publishOptions
 	for _, o := range opts {
 		o(&po)
@@ -61,10 +77,18 @@ func (c *TCPClient) publishAcked(ctx context.Context, l *link, pkt *protocol.Pub
 	if err := c.quota.acquire(ctx); err != nil {
 		return err
 	}
-	defer c.quota.release()
+	// The permit is now owned by the in-flight message, not by this
+	// goroutine. It is released at the terminal acknowledgement (in the read
+	// loop's completeOutbound / handlePubrec) or explicitly on a pre-send
+	// failure below. It is deliberately NOT released when the message is kept
+	// for session replay (ctx cancel, ack timeout, connection lost): the
+	// QoS>0 PUBLISH is still unacknowledged at the broker, so the permit must
+	// stay held or a fresh publish could push the outstanding count past
+	// Receive Maximum (§4.9 → broker DISCONNECT 0x93).
 
 	id, err := c.ids.Acquire()
 	if err != nil {
+		c.quota.release()
 		return err
 	}
 	pkt.PacketID = id
@@ -72,33 +96,42 @@ func (c *TCPClient) publishAcked(ctx context.Context, l *link, pkt *protocol.Pub
 	stored := *pkt
 	if err := c.store.Save(StoredMessage{ID: id, Kind: StoredPublish, Publish: &stored}); err != nil {
 		c.ids.Release(id)
+		c.quota.release()
 		return err
 	}
 
 	ch := c.registerWaiter(id)
 	if err := c.writeFrame(l, pkt.Encode); err != nil {
 		// The frame never (completely) reached the broker: drop the stored
-		// state and free the identifier — there is nothing to replay.
+		// state, free the identifier and release the permit — there is
+		// nothing in flight and nothing to replay.
 		c.removeWaiter(id)
 		_ = c.store.Delete(id, StoredPublish)
 		c.ids.Release(id)
+		c.quota.release()
 		return err
 	}
 
 	res, err := c.waitAck(ctx, ch)
 	if err != nil {
 		// ctx cancellation or ack timeout: the exchange is still in flight,
-		// so the identifier and stored PUBLISH survive for session replay.
+		// so the identifier, stored PUBLISH and the held send-quota permit
+		// all survive. The permit is released by completeOutbound if the
+		// broker later acks on this connection, or dropped together with the
+		// stored state when a clean-start reconnect resets the session.
 		c.removeWaiter(id)
 		return err
 	}
 	if res.err != nil {
-		// Connection lost: the waiter was already failed and cleared, and
-		// the stored PUBLISH/identifier are kept for replay.
+		// Connection lost: the waiter was already failed and cleared, and the
+		// stored PUBLISH/identifier/permit are kept for replay. The permit is
+		// re-accounted by applySession, which seeds the reconnect quota with
+		// Receive Maximum minus the still-in-flight count.
 		return res.err
 	}
 	if res.code.IsError() {
-		// The read loop already dropped the stored state and freed the id.
+		// The read loop already dropped the stored state, freed the id and
+		// released the permit.
 		return &ReasonError{Packet: "PUBLISH", Code: res.code, Reason: res.reason}
 	}
 	return nil
@@ -139,7 +172,7 @@ func (c *TCPClient) Subscribe(ctx context.Context, filter string, qos QoS, handl
 	// so a post-SUBACK registration loses that race and the first messages
 	// are silently dropped for want of a handler. Rolled back on failure.
 	prev, replaced := c.snapshotSubscription(filter)
-	c.addSubscription(filter, options, handler)
+	token := c.addSubscription(filter, options, handler)
 
 	res, err := c.requestAck(ctx, l, "SUBSCRIBE", func(id uint16) frameEncoder {
 		return &protocol.SubscribePacket{
@@ -149,7 +182,7 @@ func (c *TCPClient) Subscribe(ctx context.Context, filter string, qos QoS, handl
 		}
 	})
 	if err != nil {
-		c.restoreSubscription(filter, prev, replaced)
+		c.restoreSubscription(filter, prev, replaced, token)
 		return SubscribeResult{}, err
 	}
 	return SubscribeResult{GrantedQoS: QoS(res.code), ReasonCode: res.code}, nil

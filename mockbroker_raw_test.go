@@ -103,11 +103,14 @@ func TestMalformedUnsubackLogsWarnAndIgnores(t *testing.T) {
 	assertStillConnected(t, c)
 }
 
-// TestMalformedPublishLogsWarnAndIgnores proves an inbound PUBLISH whose
+// TestMalformedPublishTearsDownConnection proves an inbound PUBLISH whose
 // body the codec cannot decode (a topic length prefix that overruns the
-// remaining bytes) is warn-logged and dropped, without tearing the
-// connection down.
-func TestMalformedPublishLogsWarnAndIgnores(t *testing.T) {
+// remaining bytes) is treated as a fatal Malformed Packet (§4.13.1): the
+// client tears the connection down (signalling ConnectionLost) rather than
+// logging and reading on — which for a QoS 1/2 malformed PUBLISH would
+// livelock on the broker's unbounded retransmits, since the packet id was
+// never decoded and so no PUBACK/PUBREC is ever sent.
+func TestMalformedPublishTearsDownConnection(t *testing.T) {
 	t.Parallel()
 
 	b := newMockBroker(t)
@@ -125,5 +128,13 @@ func TestMalformedPublishLogsWarnAndIgnores(t *testing.T) {
 	if err := b.InjectRawFrame(buf.Bytes()); err != nil {
 		t.Fatalf("InjectRawFrame: %v", err)
 	}
-	assertStillConnected(t, c)
+
+	select {
+	case <-c.ConnectionLost():
+	case <-time.After(2 * time.Second):
+		t.Fatal("client did not tear down the connection for a malformed PUBLISH")
+	}
+	if !lcPoll(time.Second, func() bool { return !c.IsConnected() }) {
+		t.Fatal("client still reports connected after a malformed PUBLISH")
+	}
 }

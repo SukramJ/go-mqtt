@@ -123,12 +123,18 @@ func DecodeSuback(v Version, body []byte) (*SubackPacket, error) {
 	}
 	p.PacketID = pid
 
-	if v == V50 {
+	switch v {
+	case V311:
+		// MQTT 3.1.1 SUBACK carries no property block; the return codes
+		// follow the packet identifier directly.
+	case V50:
 		props, err := decodeProperties(c, tgSuback)
 		if err != nil {
 			return nil, err
 		}
 		p.Properties = props
+	default:
+		return nil, fmt.Errorf("%w: unsupported protocol version %d", ErrProtocolViolation, byte(v))
 	}
 
 	if c.remaining() == 0 {

@@ -112,11 +112,15 @@ type TCPConfig struct {
 
 // subscription is one registered filter: the wire options it was
 // subscribed with (replayed verbatim on reconnect so the delivery
-// guarantee is preserved) and the handler inbound matches route to.
+// guarantee is preserved) and the handler inbound matches route to. token
+// is a monotonic stamp assigned on every registration so a failed
+// SUBSCRIBE's rollback can tell whether a concurrent Subscribe for the same
+// filter has since superseded it (and must not be clobbered).
 type subscription struct {
 	filter  string
 	handler MessageHandler
 	options protocol.SubscribeOptions
+	token   uint64
 }
 
 // ackResult is delivered to a Publish/Subscribe waiter when its
@@ -196,6 +200,7 @@ type TCPClient struct {
 
 	subsMu sync.RWMutex
 	subs   []subscription
+	subSeq uint64 // monotonic registration stamp, guarded by subsMu
 
 	waitersMu sync.Mutex
 	waiters   map[uint16]chan ackResult
@@ -326,6 +331,17 @@ func (c *TCPClient) Connect(ctx context.Context) error {
 		_ = conn.Close()
 		return &ReasonError{Packet: "CONNECT", Code: ack.ReasonCode, Reason: reasonStringOf(ack.Properties)}
 	}
+	if err := validateConnackLimits(c.version, ack); err != nil {
+		// The broker advertised a §3.2.2.3 Protocol Error (Receive Maximum or
+		// Maximum Packet Size of 0). Refuse the session with a best-effort
+		// DISCONNECT(0x82) rather than proceeding with a corrupt send quota or
+		// packet-size limit.
+		dp := &protocol.DisconnectPacket{Version: c.version, ReasonCode: protocol.ProtocolErrorReason}
+		_ = dp.Encode(bw)
+		_ = bw.Flush()
+		_ = conn.Close()
+		return err
+	}
 	_ = conn.SetReadDeadline(time.Time{})
 
 	result := c.buildConnectResult(ack)
@@ -365,8 +381,14 @@ func (c *TCPClient) Connect(ctx context.Context) error {
 // connect. A clean start, a zero MQTT 5.0 Session Expiry, or a broker that
 // did not resume the session (Session Present = 0) all discard the stored
 // QoS>0 state, free the packet identifiers and resize the send quota from
-// scratch. Otherwise the store and identifiers are kept for replay and
-// only the quota is resized to the freshly negotiated ceiling.
+// scratch. Otherwise the store and identifiers are kept for replay.
+//
+// The quota is seeded with the negotiated ceiling minus the number of
+// QoS>0 messages still in flight: on a resumed session those are exactly
+// the StoredPublish/StoredPubrel entries replaySession is about to put back
+// on the wire, and they must keep counting against Receive Maximum until
+// their acks arrive (§4.9). On a reset session the store was just cleared,
+// so the in-flight count is zero and the quota starts at the full ceiling.
 func (c *TCPClient) applySession(result ConnectResult) {
 	reset := c.cfg.CleanStart ||
 		(c.version == protocol.V50 && c.cfg.SessionExpirySeconds == 0) ||
@@ -375,7 +397,11 @@ func (c *TCPClient) applySession(result ConnectResult) {
 		_ = c.store.Reset()
 		c.ids.Reset()
 	}
-	c.quota.reset(c.quotaSize(result))
+	size := c.quotaSize(result) - c.inflightPermits()
+	if size < 0 {
+		size = 0
+	}
+	c.quota.reset(size)
 }
 
 // quotaSize is the number of concurrent in-flight outbound QoS>0 sends the
@@ -389,6 +415,25 @@ func (c *TCPClient) quotaSize(result ConnectResult) int {
 		return int(c.cfg.MaxInflight)
 	}
 	return defaultReceiveMaximum
+}
+
+// inflightPermits counts the outbound QoS>0 exchanges still awaiting a
+// terminal acknowledgement — the StoredPublish and StoredPubrel entries,
+// each of which holds a send-quota permit. StoredInboundID (receiver-side
+// state) does not count. Used to seed the quota on (re)connect so the
+// resumed-session replay set stays accounted for against Receive Maximum.
+func (c *TCPClient) inflightPermits() int {
+	msgs, err := c.store.All()
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, m := range msgs {
+		if m.Kind == StoredPublish || m.Kind == StoredPubrel {
+			n++
+		}
+	}
+	return n
 }
 
 // replaySession retransmits the resumable QoS>0 state in ascending Seq
@@ -611,18 +656,24 @@ func (c *TCPClient) failAllWaiters() {
 }
 
 // addSubscription registers or replaces (in place, preserving order) the
-// handler and wire options for filter.
-func (c *TCPClient) addSubscription(filter string, options protocol.SubscribeOptions, handler MessageHandler) {
+// handler and wire options for filter, and returns the fresh monotonic
+// token stamped on the registration so the caller can later detect whether
+// its registration is still current.
+func (c *TCPClient) addSubscription(filter string, options protocol.SubscribeOptions, handler MessageHandler) uint64 {
 	c.subsMu.Lock()
 	defer c.subsMu.Unlock()
+	c.subSeq++
+	token := c.subSeq
 	for i := range c.subs {
 		if c.subs[i].filter == filter {
 			c.subs[i].options = options
 			c.subs[i].handler = handler
-			return
+			c.subs[i].token = token
+			return token
 		}
 	}
-	c.subs = append(c.subs, subscription{filter: filter, handler: handler, options: options})
+	c.subs = append(c.subs, subscription{filter: filter, handler: handler, options: options, token: token})
+	return token
 }
 
 // snapshotSubscription returns the current registration for filter, if
@@ -639,15 +690,34 @@ func (c *TCPClient) snapshotSubscription(filter string) (subscription, bool) {
 	return subscription{}, false
 }
 
-// restoreSubscription undoes a provisional addSubscription after a failed
-// SUBSCRIBE: it reinstates the previous registration when one existed
-// (in place, preserving order) or removes the entry entirely.
-func (c *TCPClient) restoreSubscription(filter string, prev subscription, existed bool) {
-	if existed {
-		c.addSubscription(prev.filter, prev.options, prev.handler)
+// restoreSubscription undoes a provisional addSubscription (identified by
+// token) after a failed SUBSCRIBE: it reinstates the previous registration
+// (or removes the entry) ONLY while the provisional registration is still
+// the current one. A concurrent Subscribe for the same filter that
+// registered after ours bumps the token, so its registration is left intact
+// — rolling ours back would delete a subscription the broker has accepted
+// and is delivering to, silently dropping its inbound messages.
+func (c *TCPClient) restoreSubscription(filter string, prev subscription, existed bool, token uint64) {
+	c.subsMu.Lock()
+	defer c.subsMu.Unlock()
+	idx := -1
+	for i := range c.subs {
+		if c.subs[i].filter == filter {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 || c.subs[idx].token != token {
+		// Superseded by a later Subscribe (or already gone): do not clobber.
 		return
 	}
-	c.removeSubscription(filter)
+	if existed {
+		c.subs[idx].options = prev.options
+		c.subs[idx].handler = prev.handler
+		c.subs[idx].token = prev.token
+		return
+	}
+	c.subs = append(c.subs[:idx], c.subs[idx+1:]...)
 }
 
 // removeSubscription drops the registration for filter, if any.
@@ -740,6 +810,26 @@ func buildWill(v protocol.Version, w *Will) *protocol.Will {
 	}
 	pw.Properties = props
 	return pw
+}
+
+// validateConnackLimits rejects the MQTT 5.0 CONNACK limits the spec
+// declares a Protocol Error the client MUST refuse: a Receive Maximum of 0
+// (§3.2.2.3.3) — which would starve the send quota and hang every QoS>0
+// Publish — and a Maximum Packet Size of 0 (§3.2.2.3.6). Both surface an
+// error wrapping [protocol.ErrProtocolViolation]. On an MQTT 3.1.1 link (no
+// property block) it is always a no-op.
+func validateConnackLimits(v protocol.Version, ack *protocol.ConnackPacket) error {
+	if v != protocol.V50 || ack.Properties == nil {
+		return nil
+	}
+	p := ack.Properties
+	if p.ReceiveMaximum != nil && *p.ReceiveMaximum == 0 {
+		return fmt.Errorf("mqtt/tcp: %w: broker CONNACK Receive Maximum is 0", protocol.ErrProtocolViolation)
+	}
+	if p.MaximumPacketSize != nil && *p.MaximumPacketSize == 0 {
+		return fmt.Errorf("mqtt/tcp: %w: broker CONNACK Maximum Packet Size is 0", protocol.ErrProtocolViolation)
+	}
+	return nil
 }
 
 // buildConnectResult decodes the negotiated session state from the CONNACK,
