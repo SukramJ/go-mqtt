@@ -14,8 +14,7 @@ updates:
       - "dependencies"
       - "go"
     commit-message:
-      prefix: "chore"
-      include: "scope"
+      prefix: "chore(deps)"
     groups:
       # Bundle minor/patch bumps into one PR; majors stay individual so
       # they get a focused review.
@@ -30,15 +29,13 @@ updates:
       interval: weekly
     cooldown:
       default-days: 7
-    open-pull-requests-limit: 5
     reviewers:
       - "SukramJ"
     labels:
       - "dependencies"
       - "github-actions"
     commit-message:
-      prefix: "chore"
-      include: "scope"
+      prefix: "chore(deps)"
     groups:
       github-actions:
         patterns: ["*"]
