@@ -98,6 +98,9 @@ type mockBroker struct {
 	dropPings     atomic.Bool
 	dropNextPings atomic.Int32
 	pingCount     atomic.Int32
+
+	// Client-initiated DISCONNECT counting (protocol-error teardown tests).
+	disconnectCount atomic.Int32
 }
 
 // newMockBroker starts a listener on a random local port. The listener is
@@ -299,6 +302,7 @@ func (b *mockBroker) serve(l *mockLink) {
 			}
 
 		case protocol.Disconnect:
+			b.disconnectCount.Add(1)
 			return
 
 		default:
@@ -1288,3 +1292,7 @@ func (b *mockBroker) DropNextPings(n int) { b.dropNextPings.Store(int32(n)) } //
 
 // PingCount returns the total number of PINGREQ frames received.
 func (b *mockBroker) PingCount() int { return int(b.pingCount.Load()) }
+
+// DisconnectCount returns the number of client-initiated DISCONNECT frames
+// received across all connections.
+func (b *mockBroker) DisconnectCount() int { return int(b.disconnectCount.Load()) }

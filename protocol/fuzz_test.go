@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"io"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -264,6 +265,16 @@ func FuzzPublishRoundTrip(f *testing.F) {
 		version := V311
 		if flags&0x10 != 0 {
 			version = V50
+		}
+		// The decoder rejects spec-malformed topics (wildcards; an empty
+		// topic without a v5 topic alias) that the encoder — which trusts
+		// its caller; the client pre-validates via ValidateTopicName —
+		// happily writes. Those combinations cannot round-trip by design.
+		if strings.ContainsAny(topic, "+#") {
+			t.Skip()
+		}
+		if topic == "" && (version != V50 || flags&0x20 == 0) {
+			t.Skip()
 		}
 		pkt := &PublishPacket{
 			Version: version,

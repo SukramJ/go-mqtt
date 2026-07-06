@@ -87,7 +87,8 @@ func (c *TCPClient) Publish(ctx context.Context, topic string, payload []byte, q
 // a packet identifier, persist the PUBLISH for replay, register the waiter,
 // put it on the wire, and block for the terminal acknowledgement.
 func (c *TCPClient) publishAcked(ctx context.Context, l *link, pkt *protocol.PublishPacket) error {
-	if err := c.quota.acquire(ctx); err != nil {
+	quotaGen, err := c.quota.acquire(ctx)
+	if err != nil {
 		return err
 	}
 	// The permit is now owned by the in-flight message, not by this
@@ -98,30 +99,46 @@ func (c *TCPClient) publishAcked(ctx context.Context, l *link, pkt *protocol.Pub
 	// QoS>0 PUBLISH is still unacknowledged at the broker, so the permit must
 	// stay held or a fresh publish could push the outstanding count past
 	// Receive Maximum (§4.9 → broker DISCONNECT 0x93).
+	//
+	// Every failure-path release below is generation-checked (releaseAt/
+	// ReleaseAt): if this goroutine stalls across a connection drop and the
+	// reconnect's applySession has already re-accounted the session
+	// (quota.reset / ids.Reset), the stale release must be a no-op — an
+	// unconditional one would over-credit the send quota past Receive
+	// Maximum, or free a packet identifier the new session has handed to
+	// another exchange.
 
-	id, err := c.ids.Acquire()
+	id, idGen, err := c.ids.Acquire()
 	if err != nil {
-		c.quota.release()
+		c.quota.releaseAt(quotaGen)
 		return err
 	}
 	pkt.PacketID = id
 
 	stored := *pkt
 	if err := c.store.Save(StoredMessage{ID: id, Kind: StoredPublish, Publish: &stored}); err != nil {
-		c.ids.Release(id)
-		c.quota.release()
+		c.ids.ReleaseAt(id, idGen)
+		c.quota.releaseAt(quotaGen)
 		return err
 	}
 
-	ch := c.registerWaiter(id)
+	ch := c.registerWaiter(id, ackClassPublish)
 	if err := c.writeFrame(l, pkt.Encode); err != nil {
-		// The frame never (completely) reached the broker: drop the stored
-		// state, free the identifier and release the permit — there is
-		// nothing in flight and nothing to replay.
-		c.removeWaiter(id)
-		_ = c.store.Delete(id, StoredPublish)
-		c.ids.Release(id)
-		c.quota.release()
+		c.removeWaiter(id, ch)
+		if c.quota.generation() == quotaGen {
+			// The frame never (completely) reached the broker and no
+			// reconnect has re-accounted the session since: drop the stored
+			// state, free the identifier and release the permit — there is
+			// nothing in flight and nothing to replay.
+			_ = c.store.Delete(id, StoredPublish)
+			c.ids.ReleaseAt(id, idGen)
+			c.quota.releaseAt(quotaGen)
+		}
+		// Otherwise a teardown + reconnect completed while this goroutine
+		// was parked in the failing write: applySession has re-accounted the
+		// stored entry (a resumed session counts and replays it; a reset
+		// session discarded it), so every piece of cleanup here would clobber
+		// state the new session owns.
 		return err
 	}
 
@@ -132,7 +149,7 @@ func (c *TCPClient) publishAcked(ctx context.Context, l *link, pkt *protocol.Pub
 		// all survive. The permit is released by completeOutbound if the
 		// broker later acks on this connection, or dropped together with the
 		// stored state when a clean-start reconnect resets the session.
-		c.removeWaiter(id)
+		c.removeWaiter(id, ch)
 		return err
 	}
 	if res.err != nil {
@@ -187,7 +204,7 @@ func (c *TCPClient) Subscribe(ctx context.Context, filter string, qos QoS, handl
 	prev, replaced := c.snapshotSubscription(filter)
 	token := c.addSubscription(filter, options, handler)
 
-	res, err := c.requestAck(ctx, l, "SUBSCRIBE", func(id uint16) frameEncoder {
+	res, err := c.requestAck(ctx, l, "SUBSCRIBE", ackClassSuback, func(id uint16) frameEncoder {
 		return &protocol.SubscribePacket{
 			Version:       c.version,
 			PacketID:      id,
@@ -202,7 +219,12 @@ func (c *TCPClient) Subscribe(ctx context.Context, filter string, qos QoS, handl
 }
 
 // Unsubscribe implements [Subscriber]. It sends a single-filter UNSUBSCRIBE,
-// blocks until the UNSUBACK, and removes the local handler registration.
+// blocks until the UNSUBACK, and removes the local handler registration —
+// unless a concurrent Subscribe for the same filter registered a newer
+// handler while the UNSUBSCRIBE was in flight; that registration is left
+// intact (the broker processed the later SUBSCRIBE after this UNSUBSCRIBE,
+// so its subscription is live and removing the handler would silently drop
+// its messages).
 func (c *TCPClient) Unsubscribe(ctx context.Context, filter string) error {
 	if err := protocol.ValidateTopicFilter(filter); err != nil {
 		return err
@@ -212,7 +234,8 @@ func (c *TCPClient) Unsubscribe(ctx context.Context, filter string) error {
 		return ErrNotConnected
 	}
 
-	if _, err := c.requestAck(ctx, l, "UNSUBSCRIBE", func(id uint16) frameEncoder {
+	snap, existed := c.snapshotSubscription(filter)
+	if _, err := c.requestAck(ctx, l, "UNSUBSCRIBE", ackClassUnsuback, func(id uint16) frameEncoder {
 		return &protocol.UnsubscribePacket{
 			Version:  c.version,
 			PacketID: id,
@@ -221,7 +244,9 @@ func (c *TCPClient) Unsubscribe(ctx context.Context, filter string) error {
 	}); err != nil {
 		return err
 	}
-	c.removeSubscription(filter)
+	if existed {
+		c.removeSubscriptionIfCurrent(filter, snap.token)
+	}
 	return nil
 }
 
@@ -234,17 +259,19 @@ type frameEncoder interface {
 // requestAck sends a SUBSCRIBE/UNSUBSCRIBE built by mk (given the freshly
 // allocated packet identifier), waits for its acknowledgement, and returns a
 // *ReasonError for a failure reason code. The identifier is always freed
-// afterwards — these requests are never replayed, so they hold no session
-// state across a reconnect.
-func (c *TCPClient) requestAck(ctx context.Context, l *link, packet string, mk func(id uint16) frameEncoder) (ackResult, error) {
-	id, err := c.ids.Acquire()
+// afterwards (generation-checked, so a session reset in between — which
+// already freed it, possibly to a new owner — turns the release into a
+// no-op) — these requests are never replayed, so they hold no session state
+// across a reconnect.
+func (c *TCPClient) requestAck(ctx context.Context, l *link, packet string, want ackClass, mk func(id uint16) frameEncoder) (ackResult, error) {
+	id, gen, err := c.ids.Acquire()
 	if err != nil {
 		return ackResult{}, err
 	}
-	ch := c.registerWaiter(id)
+	ch := c.registerWaiter(id, want)
 	if err := c.writeFrame(l, mk(id).Encode); err != nil {
-		c.removeWaiter(id)
-		c.ids.Release(id)
+		c.removeWaiter(id, ch)
+		c.ids.ReleaseAt(id, gen)
 		return ackResult{}, err
 	}
 	res, werr := c.waitAck(ctx, ch)
@@ -254,11 +281,11 @@ func (c *TCPClient) requestAck(ctx context.Context, l *link, packet string, mk f
 		// another SUBSCRIBE/UNSUBSCRIBE that registers its own waiter, which
 		// this trailing removeWaiter would then delete — stranding that
 		// request until its own AckTimeout despite a valid broker ack.
-		c.removeWaiter(id)
-		c.ids.Release(id)
+		c.removeWaiter(id, ch)
+		c.ids.ReleaseAt(id, gen)
 		return ackResult{}, werr
 	}
-	c.ids.Release(id)
+	c.ids.ReleaseAt(id, gen)
 	if res.err != nil {
 		return ackResult{}, res.err
 	}

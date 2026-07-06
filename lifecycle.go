@@ -118,6 +118,18 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	}
 	done := make(chan struct{})
 	l.mu.Lock()
+	if !l.started {
+		// Stop ran while the first connect was in flight: it saw no loopDone
+		// to wait for and its Disconnect hit a not-yet-connected session.
+		// Tear the just-established session down instead of leaving it
+		// connected with no reconnect loop behind a Stop that reported
+		// success. (Only Stop clears started — a mere runCtx cancellation
+		// must not disconnect an established session, per the Start
+		// contract.)
+		l.mu.Unlock()
+		_ = l.connector.Disconnect(ctx)
+		return errors.New("mqtt.lifecycle: stopped during start")
+	}
 	l.loopDone = done
 	l.mu.Unlock()
 	go func() {

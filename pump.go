@@ -65,17 +65,17 @@ func (c *TCPClient) handleFrame(l *link, frame protocol.Frame) bool {
 	case protocol.Publish:
 		return c.handlePublish(l, frame)
 	case protocol.Puback:
-		c.handleAck(l, frame, protocol.Puback)
+		return c.handleAck(l, frame, protocol.Puback)
 	case protocol.Pubrec:
-		c.handleAck(l, frame, protocol.Pubrec)
+		return c.handleAck(l, frame, protocol.Pubrec)
 	case protocol.Pubrel:
-		c.handleInboundPubrel(l, frame)
+		return c.handleInboundPubrel(l, frame)
 	case protocol.Pubcomp:
-		c.handleAck(l, frame, protocol.Pubcomp)
+		return c.handleAck(l, frame, protocol.Pubcomp)
 	case protocol.Suback:
-		c.handleSuback(frame)
+		return c.handleSuback(l, frame)
 	case protocol.Unsuback:
-		c.handleUnsuback(frame)
+		return c.handleUnsuback(l, frame)
 	case protocol.Pingresp:
 		l.outstandingPings.Store(0)
 	case protocol.Disconnect:
@@ -125,9 +125,16 @@ func (c *TCPClient) handlePublish(l *link, frame protocol.Frame) bool {
 		c.dispatch(toMessage(pub))
 	case 1:
 		c.dispatch(toMessage(pub))
+		// dispatch runs handlers synchronously and a handler may block
+		// across a teardown + reconnect; do not ack on a link that has
+		// since died (the write would fail anyway, this just skips the
+		// noise).
+		if isStopping(l) {
+			return false
+		}
 		c.sendAck(l, protocol.Puback, pub.PacketID)
 	case 2:
-		c.handleInboundQoS2(l, pub)
+		return c.handleInboundQoS2(l, pub)
 	}
 	return true
 }
@@ -161,41 +168,63 @@ func (c *TCPClient) resolveTopicAlias(l *link, pub *protocol.PublishPacket) (str
 
 // handleInboundQoS2 implements the exactly-once receiver (method A): the
 // first PUBLISH for an identifier is dispatched, recorded and PUBREC'd; a
-// duplicate re-sends only the PUBREC without re-dispatching.
-func (c *TCPClient) handleInboundQoS2(l *link, pub *protocol.PublishPacket) {
+// duplicate re-sends only the PUBREC without re-dispatching. It returns
+// false when the link died while the handler ran.
+func (c *TCPClient) handleInboundQoS2(l *link, pub *protocol.PublishPacket) bool {
 	if c.storeContains(pub.PacketID, StoredInboundID) {
 		// Already delivered; re-acknowledge without re-dispatching.
 		c.sendAck(l, protocol.Pubrec, pub.PacketID)
-		return
+		return true
 	}
 	c.dispatch(toMessage(pub))
+	if isStopping(l) {
+		// The handler blocked across a teardown — and possibly a reconnect
+		// whose applySession reset the shared store. The message was
+		// delivered, but recording its dedup entry now would poison the NEW
+		// session's state: a fresh inbound QoS 2 PUBLISH reusing this
+		// identifier would be swallowed as a duplicate. Skip the record and
+		// the moot PUBREC; the broker re-sends on the next connection and
+		// the application-level dup is the documented at-least-once cost of
+		// a blocking handler.
+		return false
+	}
 	_ = c.store.Save(StoredMessage{ID: pub.PacketID, Kind: StoredInboundID})
 	c.sendAck(l, protocol.Pubrec, pub.PacketID)
+	return true
 }
 
 // handleInboundPubrel completes the receiver-side QoS 2 handshake: PUBCOMP
 // the identifier and drop its dedup record. An unknown identifier is still
-// PUBCOMP'd (the peer must be released either way).
-func (c *TCPClient) handleInboundPubrel(l *link, frame protocol.Frame) {
+// PUBCOMP'd (the peer must be released either way). A PUBREL that cannot be
+// decoded is a Malformed Packet and fatal (§4.13.1) — reading on would
+// leave the peer's QoS 2 flow and our dedup entry stuck forever.
+func (c *TCPClient) handleInboundPubrel(l *link, frame protocol.Frame) bool {
 	ack, err := protocol.DecodeAck(c.version, protocol.Pubrel, frame.Body)
 	if err != nil {
 		c.logger.Warn("mqtt.tcp.malformed_pubrel", slog.String("err", err.Error()))
-		return
+		c.protocolError(l, protocol.MalformedPacketReason)
+		return false
 	}
 	_ = c.store.Delete(ack.PacketID, StoredInboundID)
 	c.sendAck(l, protocol.Pubcomp, ack.PacketID)
+	return true
 }
 
 // handleAck processes an inbound PUBACK (QoS 1 terminal), PUBREC (QoS 2
 // intermediate) or PUBCOMP (QoS 2 terminal) for an outbound publish,
 // advancing the session state machine and signalling the waiter on a
-// terminal transition.
-func (c *TCPClient) handleAck(l *link, frame protocol.Frame, t protocol.PacketType) {
+// terminal transition. An acknowledgement that cannot be decoded is a
+// Malformed Packet and fatal (§4.13.1): reading on would strand the
+// in-flight exchange's stored entry, packet identifier and send-quota
+// permit until the next session reset — a permanent Receive Maximum leak
+// on a long-lived connection.
+func (c *TCPClient) handleAck(l *link, frame protocol.Frame, t protocol.PacketType) bool {
 	ack, err := protocol.DecodeAck(c.version, t, frame.Body)
 	if err != nil {
 		c.logger.Warn("mqtt.tcp.malformed_ack",
 			slog.String("type", t.String()), slog.String("err", err.Error()))
-		return
+		c.protocolError(l, protocol.MalformedPacketReason)
+		return false
 	}
 	reason := reasonStringOf(ack.Properties)
 	switch t {
@@ -208,6 +237,7 @@ func (c *TCPClient) handleAck(l *link, frame protocol.Frame, t protocol.PacketTy
 	default:
 		// Unreachable: handleAck is only called for the three ack types.
 	}
+	return true
 }
 
 // completeOutbound finalises a terminal outbound QoS>0 exchange: it drops
@@ -227,7 +257,7 @@ func (c *TCPClient) completeOutbound(id uint16, kind StoredKind, res ackResult) 
 	_ = c.store.Delete(id, kind)
 	c.ids.Release(id)
 	c.quota.release()
-	if !c.signalWaiter(id, res) {
+	if !c.signalWaiter(id, ackClassPublish, res) {
 		c.logger.Debug("mqtt.tcp.ack_replayed", slog.Uint64("packet_id", uint64(id)))
 	}
 }
@@ -246,7 +276,7 @@ func (c *TCPClient) handlePubrec(l *link, ack *protocol.AckPacket, reason string
 			_ = c.store.Delete(id, StoredPublish)
 			c.ids.Release(id)
 			c.quota.release()
-			if !c.signalWaiter(id, ackResult{code: ack.ReasonCode, reason: reason}) {
+			if !c.signalWaiter(id, ackClassPublish, ackResult{code: ack.ReasonCode, reason: reason}) {
 				c.logger.Debug("mqtt.tcp.pubrec_error_replayed", slog.Uint64("packet_id", uint64(id)))
 			}
 			return
@@ -268,37 +298,45 @@ func (c *TCPClient) handlePubrec(l *link, ack *protocol.AckPacket, reason string
 }
 
 // handleSuback signals the Subscribe waiter with the first filter's reason
-// code (this client sends one filter per SUBSCRIBE).
-func (c *TCPClient) handleSuback(frame protocol.Frame) {
+// code (this client sends one filter per SUBSCRIBE). A SUBACK that cannot
+// be decoded is a fatal Malformed Packet (§4.13.1) — the in-flight
+// Subscribe would otherwise idle out its full AckTimeout against a peer
+// already known to be confused.
+func (c *TCPClient) handleSuback(l *link, frame protocol.Frame) bool {
 	sp, err := protocol.DecodeSuback(c.version, frame.Body)
 	if err != nil {
 		c.logger.Warn("mqtt.tcp.malformed_suback", slog.String("err", err.Error()))
-		return
+		c.protocolError(l, protocol.MalformedPacketReason)
+		return false
 	}
 	res := ackResult{reason: reasonStringOf(sp.Properties)}
 	if len(sp.ReasonCodes) > 0 {
 		res.code = sp.ReasonCodes[0]
 	}
-	if !c.signalWaiter(sp.PacketID, res) {
+	if !c.signalWaiter(sp.PacketID, ackClassSuback, res) {
 		c.logger.Warn("mqtt.tcp.suback_unknown_id", slog.Uint64("packet_id", uint64(sp.PacketID)))
 	}
+	return true
 }
 
 // handleUnsuback signals the Unsubscribe waiter with the first filter's
-// reason code (v5; v3 carries none, treated as success).
-func (c *TCPClient) handleUnsuback(frame protocol.Frame) {
+// reason code (v5; v3 carries none, treated as success). A malformed
+// UNSUBACK is fatal, mirroring handleSuback.
+func (c *TCPClient) handleUnsuback(l *link, frame protocol.Frame) bool {
 	up, err := protocol.DecodeUnsuback(c.version, frame.Body)
 	if err != nil {
 		c.logger.Warn("mqtt.tcp.malformed_unsuback", slog.String("err", err.Error()))
-		return
+		c.protocolError(l, protocol.MalformedPacketReason)
+		return false
 	}
 	res := ackResult{reason: reasonStringOf(up.Properties)}
 	if len(up.ReasonCodes) > 0 {
 		res.code = up.ReasonCodes[0]
 	}
-	if !c.signalWaiter(up.PacketID, res) {
+	if !c.signalWaiter(up.PacketID, ackClassUnsuback, res) {
 		c.logger.Warn("mqtt.tcp.unsuback_unknown_id", slog.Uint64("packet_id", uint64(up.PacketID)))
 	}
+	return true
 }
 
 // handleServerDisconnect logs the broker's DISCONNECT reason and treats it
@@ -312,11 +350,18 @@ func (c *TCPClient) handleServerDisconnect(l *link, frame protocol.Frame) {
 	c.teardownLink(l, false)
 }
 
-// protocolError sends a best-effort DISCONNECT carrying reason, then tears
-// the connection down as lost.
+// protocolError tears the connection down as lost, preceded on MQTT 5.0 by
+// a best-effort DISCONNECT carrying reason. On MQTT 3.1.1 no DISCONNECT is
+// sent: the v3 packet has no reason code and is defined as a CLEAN
+// disconnect that makes the broker discard the Last Will without
+// publishing it ([MQTT-3.14.4-3]) — abruptly closing the socket is the
+// conformant error signal and keeps the LWT armed for this abnormal
+// teardown.
 func (c *TCPClient) protocolError(l *link, reason protocol.ReasonCode) {
-	dp := &protocol.DisconnectPacket{Version: c.version, ReasonCode: reason}
-	_ = c.writeFrame(l, dp.Encode)
+	if c.version == protocol.V50 {
+		dp := &protocol.DisconnectPacket{Version: c.version, ReasonCode: reason}
+		_ = c.writeFrame(l, dp.Encode)
+	}
 	c.teardownLink(l, false)
 }
 

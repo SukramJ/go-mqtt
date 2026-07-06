@@ -39,7 +39,7 @@ func TestIDAllocatorExhaustion(t *testing.T) {
 	a := &idAllocator{}
 	seen := make(map[uint16]bool)
 	for i := range packetIDSpace - 1 { // 65535 non-zero identifiers
-		id, err := a.Acquire()
+		id, _, err := a.Acquire()
 		if err != nil {
 			t.Fatalf("acquire %d: %v", i, err)
 		}
@@ -54,20 +54,20 @@ func TestIDAllocatorExhaustion(t *testing.T) {
 	if len(seen) != packetIDSpace-1 {
 		t.Fatalf("expected %d unique identifiers, got %d", packetIDSpace-1, len(seen))
 	}
-	if _, err := a.Acquire(); !errors.Is(err, ErrPacketIDExhausted) {
+	if _, _, err := a.Acquire(); !errors.Is(err, ErrPacketIDExhausted) {
 		t.Fatalf("expected ErrPacketIDExhausted, got %v", err)
 	}
 
 	// Freeing exactly one identifier makes it (and only it) allocatable.
 	a.Release(1234)
-	id, err := a.Acquire()
+	id, _, err := a.Acquire()
 	if err != nil {
 		t.Fatalf("re-acquire after release: %v", err)
 	}
 	if id != 1234 {
 		t.Fatalf("expected freed identifier 1234, got %d", id)
 	}
-	if _, err := a.Acquire(); !errors.Is(err, ErrPacketIDExhausted) {
+	if _, _, err := a.Acquire(); !errors.Is(err, ErrPacketIDExhausted) {
 		t.Fatalf("expected ErrPacketIDExhausted after refill, got %v", err)
 	}
 }
@@ -75,9 +75,9 @@ func TestIDAllocatorExhaustion(t *testing.T) {
 func TestIDAllocatorWrapSkipsZero(t *testing.T) {
 	t.Parallel()
 	a := &idAllocator{next: 65534}
-	id1, err1 := a.Acquire()
-	id2, err2 := a.Acquire()
-	id3, err3 := a.Acquire() // cursor wraps through 0, which must be skipped
+	id1, _, err1 := a.Acquire()
+	id2, _, err2 := a.Acquire()
+	id3, _, err3 := a.Acquire() // cursor wraps through 0, which must be skipped
 	if err1 != nil || err2 != nil || err3 != nil {
 		t.Fatalf("acquire errors: %v %v %v", err1, err2, err3)
 	}
@@ -89,17 +89,17 @@ func TestIDAllocatorWrapSkipsZero(t *testing.T) {
 func TestIDAllocatorReset(t *testing.T) {
 	t.Parallel()
 	a := &idAllocator{}
-	first, err := a.Acquire()
+	first, _, err := a.Acquire()
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
 	for range 100 {
-		if _, err := a.Acquire(); err != nil {
+		if _, _, err := a.Acquire(); err != nil {
 			t.Fatalf("acquire: %v", err)
 		}
 	}
 	a.Reset()
-	again, err := a.Acquire()
+	again, _, err := a.Acquire()
 	if err != nil {
 		t.Fatalf("acquire after reset: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestIDAllocatorConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range 500 {
-				id, err := a.Acquire()
+				id, _, err := a.Acquire()
 				if err != nil {
 					t.Errorf("acquire: %v", err)
 					return
@@ -246,11 +246,11 @@ func TestQuotaBlockUnblockRelease(t *testing.T) {
 	t.Parallel()
 	q := newQuota(1)
 	ctx := context.Background()
-	if err := q.acquire(ctx); err != nil {
+	if _, err := q.acquire(ctx); err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
 	done := make(chan error, 1)
-	go func() { done <- q.acquire(ctx) }()
+	go func() { _, err := q.acquire(ctx); done <- err }()
 	assertNoReceive(t, done, 30*time.Millisecond)
 	q.release()
 	if err := assertReceive(t, done, time.Second); err != nil {
@@ -263,7 +263,7 @@ func TestQuotaResetUnblocks(t *testing.T) {
 	q := newQuota(0)
 	ctx := context.Background()
 	done := make(chan error, 1)
-	go func() { done <- q.acquire(ctx) }()
+	go func() { _, err := q.acquire(ctx); done <- err }()
 	assertNoReceive(t, done, 30*time.Millisecond)
 
 	q.reset(2)
@@ -271,12 +271,12 @@ func TestQuotaResetUnblocks(t *testing.T) {
 		t.Fatalf("acquire after reset: %v", err)
 	}
 	// reset(2) granted two permits; the waiter consumed one, one remains.
-	if err := q.acquire(ctx); err != nil {
+	if _, err := q.acquire(ctx); err != nil {
 		t.Fatalf("second permit after reset: %v", err)
 	}
 	// Now empty again; a fresh reset re-arms.
 	done2 := make(chan error, 1)
-	go func() { done2 <- q.acquire(ctx) }()
+	go func() { _, err := q.acquire(ctx); done2 <- err }()
 	assertNoReceive(t, done2, 30*time.Millisecond)
 	q.reset(1)
 	if err := assertReceive(t, done2, time.Second); err != nil {
@@ -289,7 +289,7 @@ func TestQuotaCtxCancel(t *testing.T) {
 	q := newQuota(0)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- q.acquire(ctx) }()
+	go func() { _, err := q.acquire(ctx); done <- err }()
 	assertNoReceive(t, done, 30*time.Millisecond)
 	cancel()
 	if err := assertReceive(t, done, time.Second); !errors.Is(err, context.Canceled) {
@@ -302,7 +302,7 @@ func TestQuotaFailConnectionLost(t *testing.T) {
 	q := newQuota(0)
 	ctx := context.Background()
 	done := make(chan error, 1)
-	go func() { done <- q.acquire(ctx) }()
+	go func() { _, err := q.acquire(ctx); done <- err }()
 	assertNoReceive(t, done, 30*time.Millisecond)
 
 	q.fail()
@@ -310,12 +310,12 @@ func TestQuotaFailConnectionLost(t *testing.T) {
 		t.Fatalf("waiter: expected ErrConnectionLost, got %v", err)
 	}
 	// While failed, acquire fails fast even without waiting.
-	if err := q.acquire(ctx); !errors.Is(err, ErrConnectionLost) {
+	if _, err := q.acquire(ctx); !errors.Is(err, ErrConnectionLost) {
 		t.Fatalf("acquire while failed: expected ErrConnectionLost, got %v", err)
 	}
 	// reset clears the failed state and re-arms permits.
 	q.reset(1)
-	if err := q.acquire(ctx); err != nil {
+	if _, err := q.acquire(ctx); err != nil {
 		t.Fatalf("acquire after reset: %v", err)
 	}
 }
@@ -325,7 +325,7 @@ func TestQuotaAvailableIgnoresCancelledCtx(t *testing.T) {
 	q := newQuota(1)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := q.acquire(ctx); err != nil {
+	if _, err := q.acquire(ctx); err != nil {
 		t.Fatalf("an immediately available permit must be granted despite a cancelled ctx: %v", err)
 	}
 }
@@ -343,7 +343,7 @@ func TestQuotaConcurrentBound(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range 200 {
-				if err := q.acquire(ctx); err != nil {
+				if _, err := q.acquire(ctx); err != nil {
 					t.Errorf("acquire: %v", err)
 					return
 				}

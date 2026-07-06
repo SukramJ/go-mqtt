@@ -36,7 +36,7 @@ func TestIDAllocatorReleaseZeroIsNoop(t *testing.T) {
 
 	a := &idAllocator{}
 	a.Release(0)
-	id, err := a.Acquire()
+	id, _, err := a.Acquire()
 	if err != nil {
 		t.Fatalf("acquire after Release(0): %v", err)
 	}

@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // PublishPacket is an application message. DUP, QoS and RETAIN travel in
@@ -69,8 +70,11 @@ func (p *PublishPacket) Encode(w io.Writer) error {
 
 // DecodePublish decodes a PUBLISH packet for protocol version v. header is
 // the fixed-header byte (DUP/QoS/RETAIN live in its low nibble); body is
-// the remaining bytes. A QoS of 3 is illegal and yields
-// [ErrMalformedPacket]. For [V50] a property block follows the packet
+// the remaining bytes. A QoS of 3, a QoS 1/2 packet with a zero packet
+// identifier ([MQTT-2.2.1-2]), a topic name containing a wildcard
+// character ([MQTT-3.3.2-2]) and an empty topic name (legal only on [V50]
+// when a Topic Alias property resolves it, §3.3.2.1) are all illegal and
+// yield [ErrMalformedPacket]. For [V50] a property block follows the packet
 // identifier. The payload is whatever bytes remain after the variable
 // header. Any truncation or illegal property yields an error wrapping
 // [ErrMalformedPacket]; decoding never panics.
@@ -93,12 +97,18 @@ func DecodePublish(v Version, header byte, body []byte) (*PublishPacket, error) 
 	if err != nil {
 		return nil, err
 	}
+	if strings.ContainsAny(topic, "+#") {
+		return nil, wrapMalformed("PUBLISH topic contains a wildcard character")
+	}
 	p.Topic = topic
 
 	if qos > 0 {
 		id, err := c.readUint16()
 		if err != nil {
 			return nil, err
+		}
+		if id == 0 {
+			return nil, wrapMalformed("PUBLISH QoS >0 with zero packet identifier")
 		}
 		p.PacketID = id
 	}
@@ -109,6 +119,10 @@ func DecodePublish(v Version, header byte, body []byte) (*PublishPacket, error) 
 			return nil, err
 		}
 		p.Properties = props
+	}
+
+	if topic == "" && (v != V50 || p.Properties == nil || p.Properties.TopicAlias == nil) {
+		return nil, wrapMalformed("PUBLISH with empty topic and no topic alias")
 	}
 
 	p.Payload = c.readRest()

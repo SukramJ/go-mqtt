@@ -127,7 +127,7 @@ func TestRequestAckTimeoutReleasesIDAndWaiter(t *testing.T) {
 	c.cfg.AckTimeout = 50 * time.Millisecond
 	l := &link{w: bufio.NewWriter(io.Discard), stop: make(chan struct{})}
 
-	_, err := c.requestAck(context.Background(), l, "SUBSCRIBE", func(id uint16) frameEncoder {
+	_, err := c.requestAck(context.Background(), l, "SUBSCRIBE", ackClassSuback, func(id uint16) frameEncoder {
 		return &protocol.SubscribePacket{
 			Version:       protocol.V50,
 			PacketID:      id,
@@ -144,7 +144,7 @@ func TestRequestAckTimeoutReleasesIDAndWaiter(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("waiters = %d after a timed-out requestAck, want 0 (waiter removed)", n)
 	}
-	if _, aerr := c.ids.Acquire(); aerr != nil {
+	if _, _, aerr := c.ids.Acquire(); aerr != nil {
 		t.Fatalf("Acquire after a timed-out requestAck: %v (id not released)", aerr)
 	}
 }
