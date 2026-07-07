@@ -206,11 +206,37 @@ func TestDecodePublishMalformed(t *testing.T) {
 		{"missing packet id", V311, 0x32, []byte{0x00, 0x01, 't'}},
 		{"v5 prop overrun", V50, 0x30, []byte{0x00, 0x01, 't', 0x05, 0x01}},
 		{"v5 bad property", V50, 0x30, []byte{0x00, 0x01, 't', 0x02, 0x12, 0x00}},
+		// [MQTT-2.2.1-2]: a QoS>0 PUBLISH requires a non-zero packet id.
+		{"v3 qos1 zero packet id", V311, 0x32, []byte{0x00, 0x01, 't', 0x00, 0x00}},
+		{"v5 qos2 zero packet id", V50, 0x34, []byte{0x00, 0x01, 't', 0x00, 0x00, 0x00}},
+		// [MQTT-3.3.2-2]: topic names must not contain wildcards.
+		{"v3 wildcard hash topic", V311, 0x30, []byte{0x00, 0x03, 'a', '/', '#'}},
+		{"v3 wildcard plus topic", V311, 0x30, []byte{0x00, 0x03, 'a', '/', '+'}},
+		{"v5 wildcard topic", V50, 0x30, []byte{0x00, 0x01, '#', 0x00}},
+		// §4.7.3 / §3.3.2.1: an empty topic is legal only with a v5 alias.
+		{"v3 empty topic", V311, 0x30, []byte{0x00, 0x00}},
+		{"v5 empty topic no alias", V50, 0x30, []byte{0x00, 0x00, 0x00}},
 	}
 	for _, tc := range cases {
 		if _, err := DecodePublish(tc.v, tc.header, tc.body); !errors.Is(err, ErrMalformedPacket) {
 			t.Fatalf("%s: got %v, want ErrMalformedPacket", tc.name, err)
 		}
+	}
+}
+
+// TestDecodePublishEmptyTopicWithAliasAccepted pins the one legal
+// empty-topic form: a v5 PUBLISH resolving through a Topic Alias property
+// (0x23) must keep decoding.
+func TestDecodePublishEmptyTopicWithAliasAccepted(t *testing.T) {
+	t.Parallel()
+	// topic "" + property block {len 3, TopicAlias(0x23) = 4} + payload.
+	body := []byte{0x00, 0x00, 0x03, 0x23, 0x00, 0x04, 'p'}
+	p, err := DecodePublish(V50, 0x30, body)
+	if err != nil {
+		t.Fatalf("DecodePublish: %v", err)
+	}
+	if p.Properties == nil || p.Properties.TopicAlias == nil || *p.Properties.TopicAlias != 4 {
+		t.Fatalf("TopicAlias not decoded: %+v", p.Properties)
 	}
 }
 

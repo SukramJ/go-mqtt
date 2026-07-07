@@ -192,13 +192,15 @@ type idAllocator struct {
 	used [1024]uint64
 	mu   sync.Mutex
 	next uint16
+	gen  uint64
 }
 
-// Acquire reserves and returns a free non-zero packet identifier. It scans
-// forward from the internal cursor, wrapping around, and skips identifier
-// 0 and any already in use. When every non-zero identifier is taken it
-// returns [ErrPacketIDExhausted].
-func (a *idAllocator) Acquire() (uint16, error) {
+// Acquire reserves and returns a free non-zero packet identifier together
+// with the allocator generation it belongs to (see [idAllocator.ReleaseAt]).
+// It scans forward from the internal cursor, wrapping around, and skips
+// identifier 0 and any already in use. When every non-zero identifier is
+// taken it returns [ErrPacketIDExhausted].
+func (a *idAllocator) Acquire() (id uint16, gen uint64, err error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for range packetIDSpace {
@@ -210,14 +212,17 @@ func (a *idAllocator) Acquire() (uint16, error) {
 		word, bit := id>>6, uint64(1)<<(id&63)
 		if a.used[word]&bit == 0 {
 			a.used[word] |= bit
-			return id, nil
+			return id, a.gen, nil
 		}
 	}
-	return 0, ErrPacketIDExhausted
+	return 0, a.gen, ErrPacketIDExhausted
 }
 
 // Release returns id to the free set. Releasing 0 or an already-free
-// identifier is a no-op.
+// identifier is a no-op. Use only from the current connection's read loop,
+// where the identifier is known to belong to the live session; a goroutine
+// whose acquire may have preceded a session reset must use
+// [idAllocator.ReleaseAt] instead.
 func (a *idAllocator) Release(id uint16) {
 	if id == 0 {
 		return
@@ -227,12 +232,32 @@ func (a *idAllocator) Release(id uint16) {
 	a.mu.Unlock()
 }
 
-// Reset frees every identifier and rewinds the cursor. Used when a session
-// is discarded (clean start, or Session Present = 0).
+// ReleaseAt returns id to the free set only when gen still matches the
+// allocator generation the id was acquired under. A [idAllocator.Reset] in
+// between (a discarded session) bumps the generation, making the release a
+// no-op: the reset already freed every identifier, and the id may since
+// have been handed to a new-session request — freeing it here would let two
+// concurrent exchanges share one identifier on the wire.
+func (a *idAllocator) ReleaseAt(id uint16, gen uint64) {
+	if id == 0 {
+		return
+	}
+	a.mu.Lock()
+	if gen == a.gen {
+		a.used[id>>6] &^= uint64(1) << (id & 63)
+	}
+	a.mu.Unlock()
+}
+
+// Reset frees every identifier, rewinds the cursor and advances the
+// allocator generation so a stale [idAllocator.ReleaseAt] from before the
+// reset becomes a no-op. Used when a session is discarded (clean start, or
+// Session Present = 0).
 func (a *idAllocator) Reset() {
 	a.mu.Lock()
 	a.used = [1024]uint64{}
 	a.next = 0
+	a.gen++
 	a.mu.Unlock()
 }
 
@@ -251,6 +276,7 @@ type quota struct {
 	wake   chan struct{}
 	mu     sync.Mutex
 	avail  int
+	gen    uint64
 	failed bool
 }
 
@@ -259,39 +285,60 @@ func newQuota(n int) *quota {
 	return &quota{avail: n, wake: make(chan struct{})}
 }
 
-// acquire takes one permit, blocking until one is available. It returns
-// early with ctx.Err() if ctx is cancelled, and with [ErrConnectionLost]
-// if fail() is invoked while it waits (or has already been invoked). A
-// permit that is immediately available is granted without consulting ctx.
-func (q *quota) acquire(ctx context.Context) error {
+// acquire takes one permit, blocking until one is available, and returns
+// the quota generation the permit was granted under (see
+// [quota.releaseAt]). It returns early with ctx.Err() if ctx is cancelled,
+// and with [ErrConnectionLost] if fail() is invoked while it waits (or has
+// already been invoked). A permit that is immediately available is granted
+// without consulting ctx.
+func (q *quota) acquire(ctx context.Context) (uint64, error) {
 	for {
 		q.mu.Lock()
 		if q.failed {
+			gen := q.gen
 			q.mu.Unlock()
-			return ErrConnectionLost
+			return gen, ErrConnectionLost
 		}
 		if q.avail > 0 {
 			q.avail--
+			gen := q.gen
 			q.mu.Unlock()
-			return nil
+			return gen, nil
 		}
 		wake := q.wake
 		q.mu.Unlock()
 
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return 0, ctx.Err()
 		case <-wake:
 			// State changed (release/reset/fail); re-evaluate.
 		}
 	}
 }
 
-// release returns one permit and wakes any waiters.
+// release returns one permit and wakes any waiters. Use only from the
+// current connection's read loop, which credits the live epoch by
+// construction; a goroutine whose acquire may have preceded a reset must
+// use [quota.releaseAt] instead.
 func (q *quota) release() {
 	q.mu.Lock()
 	q.avail++
 	q.broadcast()
+	q.mu.Unlock()
+}
+
+// releaseAt returns one permit only when gen still matches the quota
+// generation the permit was granted under. A reset in between (a reconnect
+// re-seeding the quota to Receive Maximum minus the in-flight count) has
+// already re-accounted every permit absolutely, so crediting a stale one
+// here would push the ceiling past the broker's Receive Maximum (§4.9).
+func (q *quota) releaseAt(gen uint64) {
+	q.mu.Lock()
+	if gen == q.gen {
+		q.avail++
+		q.broadcast()
+	}
 	q.mu.Unlock()
 }
 
@@ -310,12 +357,23 @@ func (q *quota) release() {
 // the previous connection's parked sends were already unblocked by fail()
 // without releasing (their messages survive for replay), no release races
 // this reset and avail never transiently exceeds the ceiling.
+// A stalled Publish goroutine from before the drop that unwinds after this
+// reset releases through [quota.releaseAt], which the generation bump below
+// turns into a no-op.
 func (q *quota) reset(n int) {
 	q.mu.Lock()
 	q.avail = n
+	q.gen++
 	q.failed = false
 	q.broadcast()
 	q.mu.Unlock()
+}
+
+// generation returns the current quota generation (see [quota.releaseAt]).
+func (q *quota) generation() uint64 {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.gen
 }
 
 // fail marks the quota failed and wakes every waiter so each returns

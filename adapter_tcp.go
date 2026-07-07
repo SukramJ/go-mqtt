@@ -100,8 +100,15 @@ type TCPConfig struct {
 	// 3.1.1 link (which has no Receive Maximum). Zero selects 65535.
 	MaxInflight uint16
 
-	// TLSConfig is used for tls:// endpoints. When nil a minimal config
-	// verifying the broker hostname is built automatically.
+	// TLSConfig is used for tls:// endpoints (tls://, ssl://, mqtts://).
+	// When nil a minimal config verifying the broker hostname is built
+	// automatically. A supplied config is cloned before use and, when its
+	// ServerName is empty, the hostname from BrokerURL is filled in — so a
+	// CA-pinning config (RootCAs only) verifies the broker identity instead
+	// of failing the handshake. On a non-TLS scheme (tcp://, mqtt://) a
+	// configured TLSConfig is NOT used; Connect logs a warning because the
+	// connection proceeds in plaintext despite transport security having
+	// been configured.
 	TLSConfig *tls.Config
 	// Will is the optional Last Will and Testament published by the broker
 	// if the connection drops without a clean DISCONNECT.
@@ -134,6 +141,43 @@ type ackResult struct {
 	code   ReasonCode
 }
 
+// ackClass is the acknowledgement family a waiter expects. Packet
+// identifiers are shared across PUBLISH/SUBSCRIBE/UNSUBSCRIBE, so without
+// the class a broker could complete an in-flight QoS>0 Publish with a
+// forged SUBACK carrying the same identifier — reporting success for a
+// message it never acknowledged (and stranding the stored entry, the
+// identifier and the send-quota permit). PUBACK, PUBREC-error and PUBCOMP
+// collapse into one class: a QoS 2 waiter is legitimately resolved by
+// either.
+type ackClass uint8
+
+const (
+	ackClassPublish ackClass = iota + 1
+	ackClassSuback
+	ackClassUnsuback
+)
+
+// String returns a short label for structured log fields.
+func (a ackClass) String() string {
+	switch a {
+	case ackClassPublish:
+		return "publish-ack"
+	case ackClassSuback:
+		return "suback"
+	case ackClassUnsuback:
+		return "unsuback"
+	default:
+		return "unknown"
+	}
+}
+
+// waiter is one registered acknowledgement waiter: the buffered result
+// channel and the acknowledgement class that may legitimately resolve it.
+type waiter struct {
+	ch   chan ackResult
+	want ackClass
+}
+
 // link is the mutable per-connection state. Every field is owned by one
 // connection; a reconnect builds a fresh link and swaps it in atomically,
 // so the read and keep-alive loops never observe a half-torn-down
@@ -155,6 +199,12 @@ type link struct {
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 
+	// graceful is set by Disconnect before its best-effort DISCONNECT
+	// write, so a write failure inside writeFrame tears the link down
+	// without signalling a lost connection (which would trigger a spurious
+	// lifecycle reconnect after an intentional shutdown).
+	graceful atomic.Bool
+
 	aliases map[uint16]string
 
 	outboundMax      uint32 // broker Maximum Packet Size; 0 = unlimited
@@ -172,19 +222,27 @@ type link struct {
 // to stay deadlock-free they are always acquired in this order and no lock
 // is ever held across a blocking channel receive or a socket write:
 //
-//	quota.mu → ids.mu → store.mu → waitersMu → link.sendMu
+//	connMu → quota.mu → ids.mu → store.mu → waitersMu → link.sendMu
 //
-// In practice these critical sections do not nest: the read loop signals a
-// waiter (waitersMu) and then, separately, writes a reply (sendMu); the
-// publish path acquires quota, then an id, saves to the store, registers a
-// waiter, and only then writes. link.sendMu is a leaf — nothing else is
-// acquired while it is held. subsMu (the subscription slice) is
-// independent of all the above; the read loop copies the matching handlers
-// out from under it before invoking them.
+// connMu is outermost and long-lived by design: it serialises Connect and
+// Disconnect end-to-end (including the dial and the CONNACK round-trip) so
+// two concurrent Connect calls can never establish two live links sharing
+// one session state. It is never taken by the read/keep-alive loops or the
+// publish path. In practice the remaining critical sections do not nest:
+// the read loop signals a waiter (waitersMu) and then, separately, writes
+// a reply (sendMu); the publish path acquires quota, then an id, saves to
+// the store, registers a waiter, and only then writes. link.sendMu is a
+// leaf — nothing else is acquired while it is held. subsMu (the
+// subscription slice) is independent of all the above; the read loop
+// copies the matching handlers out from under it before invoking them.
 type TCPClient struct {
 	cfg     TCPConfig
 	logger  *slog.Logger
 	version protocol.Version
+
+	// connMu serialises Connect and Disconnect (see the lock-order note
+	// above).
+	connMu sync.Mutex
 
 	inboundMax uint32
 	// pingInterval, when non-zero, overrides the keep-alive-derived ping
@@ -203,7 +261,7 @@ type TCPClient struct {
 	subSeq uint64 // monotonic registration stamp, guarded by subsMu
 
 	waitersMu sync.Mutex
-	waiters   map[uint16]chan ackResult
+	waiters   map[uint16]waiter
 
 	lostCh chan struct{}
 
@@ -248,7 +306,7 @@ func NewTCPClient(cfg TCPConfig) *TCPClient {
 		inboundMax: inboundMax,
 		store:      newMemStore(),
 		quota:      newQuota(0),
-		waiters:    make(map[uint16]chan ackResult),
+		waiters:    make(map[uint16]waiter),
 		lostCh:     make(chan struct{}, 1),
 	}
 }
@@ -283,8 +341,13 @@ func (c *TCPClient) ConnectResult() (ConnectResult, bool) {
 // CONNACK, applies the negotiated limits, replays any resumable session
 // state and prior subscriptions, and starts the read and keep-alive loops.
 // A live link makes it a no-op that returns a wrapped [ErrAlreadyConnected]
-// so [Lifecycle] treats it as idempotent.
+// so [Lifecycle] treats it as idempotent. Connect and Disconnect are
+// serialised against each other (connMu), so concurrent calls cannot
+// establish two live links sharing one session state.
 func (c *TCPClient) Connect(ctx context.Context) error {
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+
 	if c.link.Load() != nil {
 		return fmt.Errorf("mqtt/tcp: %w", ErrAlreadyConnected)
 	}
@@ -293,13 +356,39 @@ func (c *TCPClient) Connect(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("mqtt/tcp: bad broker url: %w", err)
 	}
+	if c.cfg.Will != nil {
+		// Fail fast on an invalid will topic instead of letting the broker
+		// reject (or drop the connection over) a malformed CONNECT on every
+		// reconnect attempt — a silent reconnect loop with no useful error.
+		if err := protocol.ValidateTopicName(c.cfg.Will.Topic); err != nil {
+			return fmt.Errorf("mqtt/tcp: will topic: %w", err)
+		}
+		if c.version == protocol.V50 && c.cfg.Will.ResponseTopic != "" {
+			if err := protocol.ValidateTopicName(c.cfg.Will.ResponseTopic); err != nil {
+				return fmt.Errorf("mqtt/tcp: will response topic: %w", err)
+			}
+		}
+	}
 
-	dialCtx, cancel := context.WithTimeout(ctx, c.cfg.DialTimeout)
+	// One DialTimeout budget covers the dial, the TLS handshake AND the
+	// CONNECT/CONNACK round-trip, matching the field's documented contract.
+	deadline := time.Now().Add(c.cfg.DialTimeout)
+	dialCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	conn, err := c.dial(dialCtx, u)
 	if err != nil {
 		return fmt.Errorf("mqtt/tcp: dial: %w", err)
 	}
+
+	// The absolute deadline bounds every pre-session read AND write: a
+	// broker that accepts TCP but never reads cannot park the CONNECT flush
+	// (or a mid-encode bufio auto-flush) forever. The AfterFunc additionally
+	// propagates a caller ctx cancellation: it poisons the deadline so a
+	// blocked write/read unwinds promptly instead of running out the full
+	// DialTimeout on a context the caller has abandoned.
+	_ = conn.SetDeadline(deadline)
+	stop := context.AfterFunc(dialCtx, func() { _ = conn.SetDeadline(time.Unix(1, 0)) })
+	defer stop()
 
 	bw := bufio.NewWriter(conn)
 	if err := c.buildConnectPacket().Encode(bw); err != nil {
@@ -308,15 +397,14 @@ func (c *TCPClient) Connect(ctx context.Context) error {
 	}
 	if err := bw.Flush(); err != nil {
 		_ = conn.Close()
-		return fmt.Errorf("mqtt/tcp: send connect: %w", err)
+		return fmt.Errorf("mqtt/tcp: send connect: %w", connectAbortCause(dialCtx, err))
 	}
 
-	_ = conn.SetReadDeadline(time.Now().Add(c.cfg.DialTimeout))
 	br := bufio.NewReader(conn)
 	frame, err := protocol.ReadFrame(br, c.inboundMax)
 	if err != nil {
 		_ = conn.Close()
-		return fmt.Errorf("mqtt/tcp: read connack: %w", err)
+		return fmt.Errorf("mqtt/tcp: read connack: %w", connectAbortCause(dialCtx, err))
 	}
 	if frame.PacketType() != protocol.Connack {
 		_ = conn.Close()
@@ -342,7 +430,14 @@ func (c *TCPClient) Connect(ctx context.Context) error {
 		_ = conn.Close()
 		return err
 	}
-	_ = conn.SetReadDeadline(time.Time{})
+	if !stop() {
+		// The caller's ctx was cancelled (or the deadline expired) while the
+		// CONNACK was in flight: the deadline may already be poisoned and the
+		// caller has moved on. Never establish a session on a dead context.
+		_ = conn.Close()
+		return fmt.Errorf("mqtt/tcp: connect aborted: %w", context.Cause(dialCtx))
+	}
+	_ = conn.SetDeadline(time.Time{})
 
 	result := c.buildConnectResult(ack)
 	c.result.Store(&result)
@@ -359,22 +454,47 @@ func (c *TCPClient) Connect(ctx context.Context) error {
 	}
 
 	c.applySession(result)
+
+	// Replay stored QoS>0 state and prior subscriptions BEFORE publishing
+	// the link pointer: the spec requires unacknowledged PUBLISH/PUBREL
+	// packets to be re-sent ahead of any new traffic on a resumed session
+	// ([MQTT-4.4.0-1] / v5 §4.4), and a concurrent Publish passes the link
+	// check the instant the pointer is stored. Until then it keeps failing
+	// fast with ErrNotConnected, per the documented contract.
+	c.replaySession(l)
+	c.replaySubscriptions(l)
+	if isStopping(l) {
+		// A replay write failed and tore the link down before it was ever
+		// published. Surface the failure instead of storing a dead link the
+		// loops would never clear.
+		return fmt.Errorf("mqtt/tcp: %w: connection lost during session replay", ErrConnectionLost)
+	}
+
 	c.link.Store(l)
 	now := time.Now()
 	c.connectedAt.Store(&now)
-
-	c.replaySession(l)
-	c.replaySubscriptions(l)
 
 	l.wg.Add(2)
 	go c.readLoop(l)
 	go c.keepAliveLoop(l)
 
 	c.logger.Info("mqtt.tcp.connected",
-		slog.String("broker", c.cfg.BrokerURL),
+		slog.String("broker", u.Redacted()),
 		slog.String("version", c.version.String()),
 		slog.Bool("session_present", result.SessionPresent))
 	return nil
+}
+
+// connectAbortCause maps a socket error during the CONNECT/CONNACK
+// round-trip back to the context cause when the caller's ctx (or the
+// DialTimeout deadline) aborted it — the AfterFunc in Connect surfaces a
+// cancellation as a poisoned deadline, which would otherwise read as an
+// opaque i/o timeout.
+func connectAbortCause(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
+	return err
 }
 
 // applySession decides whether the resumed session state survives this
@@ -487,7 +607,7 @@ func (c *TCPClient) replaySubscriptions(l *link) {
 	c.subsMu.RUnlock()
 
 	for _, s := range subs {
-		id, err := c.ids.Acquire()
+		id, gen, err := c.ids.Acquire()
 		if err != nil {
 			c.logger.Warn("mqtt.tcp.resubscribe", slog.String("filter", s.filter), slog.String("err", err.Error()))
 			continue
@@ -497,32 +617,33 @@ func (c *TCPClient) replaySubscriptions(l *link) {
 			PacketID:      id,
 			Subscriptions: []protocol.Subscription{{Filter: s.filter, Options: s.options}},
 		}
-		ch := c.registerWaiter(id)
+		ch := c.registerWaiter(id, ackClassSuback)
 		if err := c.writeFrame(l, pkt.Encode); err != nil {
-			c.removeWaiter(id)
-			c.ids.Release(id)
+			c.removeWaiter(id, ch)
+			c.ids.ReleaseAt(id, gen)
 			c.logger.Warn("mqtt.tcp.resubscribe", slog.String("filter", s.filter), slog.String("err", err.Error()))
 			continue
 		}
 		l.wg.Add(1)
-		go c.awaitResubscribe(l, id, s.filter, ch)
+		go c.awaitResubscribe(l, id, gen, s.filter, ch)
 	}
 }
 
 // awaitResubscribe consumes the SUBACK for a replayed subscription and logs
-// a rejection, then frees the identifier. A connection drop resolves it via
-// the failed waiter or the link's stop channel.
-func (c *TCPClient) awaitResubscribe(l *link, id uint16, filter string, ch chan ackResult) {
+// a rejection, then frees the identifier (generation-checked: a session
+// reset in between already freed it, possibly to a new owner). A connection
+// drop resolves it via the failed waiter or the link's stop channel.
+func (c *TCPClient) awaitResubscribe(l *link, id uint16, gen uint64, filter string, ch chan ackResult) {
 	defer l.wg.Done()
 	var res ackResult
 	select {
 	case res = <-ch:
 	case <-l.stop:
-		c.removeWaiter(id)
-		c.ids.Release(id)
+		c.removeWaiter(id, ch)
+		c.ids.ReleaseAt(id, gen)
 		return
 	}
-	c.ids.Release(id)
+	c.ids.ReleaseAt(id, gen)
 	if res.err != nil {
 		return
 	}
@@ -534,12 +655,19 @@ func (c *TCPClient) awaitResubscribe(l *link, id uint16, filter string, ch chan 
 
 // Disconnect implements [Connector]. It sends a best-effort DISCONNECT,
 // tears the link down gracefully (no connection-lost signal), and waits —
-// bounded by ctx — for the read and keep-alive loops to exit.
+// bounded by ctx — for the read and keep-alive loops to exit. It is
+// serialised against Connect (connMu), so it can no longer report success
+// while a concurrent Connect is mid-handshake and about to establish a
+// fresh link.
 func (c *TCPClient) Disconnect(ctx context.Context) error {
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+
 	l := c.link.Load()
 	if l == nil {
 		return nil
 	}
+	l.graceful.Store(true)
 	dp := &protocol.DisconnectPacket{Version: c.version, ReasonCode: protocol.NormalDisconnection}
 	_ = c.writeFrame(l, dp.Encode)
 	c.teardownLink(l, true)
@@ -559,23 +687,51 @@ func (c *TCPClient) Disconnect(ctx context.Context) error {
 // flushes it in a single pass so a partial write never leaves a truncated
 // fixed header on the wire. A nil link (already disconnected) yields
 // [ErrNotConnected].
+//
+// Every write is bounded by an AckTimeout write deadline: a broker (or a
+// half-open NAT path) that stops reading fills the kernel send buffer and
+// would otherwise park the writer — holding sendMu — for the TCP
+// retransmission timeout (~15 min), freezing every Publish AND the
+// keep-alive watchdog (whose PINGREQ blocks on the same mutex). A failed
+// write or flush tears the link down here rather than in the callers: the
+// deadline may have expired mid-write, leaving a truncated frame on the
+// wire and a poisoned bufio.Writer, so the link is unusable for any
+// subsequent frame. Pre-wire failures (encode errors, ErrPacketTooLarge)
+// leave the link intact.
 func (c *TCPClient) writeFrame(l *link, encode func(io.Writer) error) error {
 	if l == nil {
 		return ErrNotConnected
 	}
 	l.sendMu.Lock()
-	defer l.sendMu.Unlock()
 	l.buf.Reset()
 	if err := encode(&l.buf); err != nil {
+		l.sendMu.Unlock()
 		return err
 	}
 	if l.outboundMax != 0 && uint32(l.buf.Len()) > l.outboundMax { //nolint:gosec // buf length is non-negative
+		l.sendMu.Unlock()
 		return ErrPacketTooLarge
 	}
-	if _, err := l.w.Write(l.buf.Bytes()); err != nil {
+	// l.conn is nil only for the bare links package tests construct; a
+	// dialed link always carries its socket.
+	if l.conn != nil {
+		_ = l.conn.SetWriteDeadline(time.Now().Add(c.cfg.AckTimeout))
+	}
+	_, err := l.w.Write(l.buf.Bytes())
+	if err == nil {
+		err = l.w.Flush()
+	}
+	if err == nil && l.conn != nil {
+		_ = l.conn.SetWriteDeadline(time.Time{})
+	}
+	// sendMu is a leaf lock: release it before teardownLink acquires
+	// waitersMu and quota.mu.
+	l.sendMu.Unlock()
+	if err != nil {
+		c.teardownLink(l, l.graceful.Load())
 		return err
 	}
-	return l.w.Flush()
+	return nil
 }
 
 // teardownLink closes a connection exactly once. It stops the loops, closes
@@ -586,11 +742,23 @@ func (c *TCPClient) writeFrame(l *link, encode func(io.Writer) error) error {
 // session can complete them. When graceful is false (a detected drop, not a
 // caller Disconnect) it signals the connection-lost channel so a lifecycle
 // loop reconnects.
+//
+// When l is not (or no longer) the current link — it failed during the
+// pre-publish session replay, or a newer connection has since been
+// established — only the socket is closed: failing the shared waiters and
+// quota, or signalling a lost connection, would sabotage the healthy
+// current link. connMu makes that state unreachable through Connect/
+// Disconnect themselves; the guard is defence in depth for the replay
+// window, where the link exists but was never published.
 func (c *TCPClient) teardownLink(l *link, graceful bool) {
 	l.closeOnce.Do(func() {
 		close(l.stop)
-		_ = l.conn.Close()
-		c.link.CompareAndSwap(l, nil)
+		if l.conn != nil {
+			_ = l.conn.Close()
+		}
+		if !c.link.CompareAndSwap(l, nil) {
+			return
+		}
 		c.failAllWaiters()
 		c.quota.fail()
 		if !graceful {
@@ -604,40 +772,62 @@ func (c *TCPClient) teardownLink(l *link, graceful bool) {
 
 // registerWaiter installs a buffered result channel for the packet
 // identifier so the read loop can hand the acknowledgement back to the
-// blocked Publish/Subscribe caller.
-func (c *TCPClient) registerWaiter(id uint16) chan ackResult {
+// blocked Publish/Subscribe caller. want records which acknowledgement
+// class may resolve the waiter (see [ackClass]).
+func (c *TCPClient) registerWaiter(id uint16, want ackClass) chan ackResult {
 	ch := make(chan ackResult, 1)
 	c.waitersMu.Lock()
-	c.waiters[id] = ch
+	c.waiters[id] = waiter{ch: ch, want: want}
 	c.waitersMu.Unlock()
 	return ch
 }
 
-// removeWaiter drops the waiter for id. Safe to call for an already-removed
-// id.
-func (c *TCPClient) removeWaiter(id uint16) {
+// removeWaiter drops the waiter for id, but only while ch is still the
+// registered channel. Safe to call for an already-removed id. The channel
+// check keeps a stale goroutine — one whose waiter was already failed and
+// cleared by a teardown, after which a reconnected session may have handed
+// the same identifier to a new request — from deleting the new owner's
+// waiter and stranding that request until its AckTimeout.
+func (c *TCPClient) removeWaiter(id uint16, ch chan ackResult) {
 	c.waitersMu.Lock()
-	delete(c.waiters, id)
+	if w, ok := c.waiters[id]; ok && w.ch == ch {
+		delete(c.waiters, id)
+	}
 	c.waitersMu.Unlock()
 }
 
 // signalWaiter delivers res to the waiter for id (removing it) and reports
 // whether one was registered. The send is non-blocking: the channel is
 // buffered and each waiter is signalled at most once.
-func (c *TCPClient) signalWaiter(id uint16, res ackResult) bool {
+//
+// got is the acknowledgement class carrying the signal. A registered waiter
+// expecting a different class is a protocol violation (e.g. a SUBACK
+// carrying the packet identifier of an in-flight QoS>0 PUBLISH); the waiter
+// is left registered — it resolves through the real acknowledgement, its
+// AckTimeout/ctx, or the connection dropping — and the mismatch is
+// warn-logged. It still reports true so callers do not double-log an
+// unknown identifier.
+func (c *TCPClient) signalWaiter(id uint16, got ackClass, res ackResult) bool {
 	c.waitersMu.Lock()
-	ch, ok := c.waiters[id]
-	if ok {
+	w, ok := c.waiters[id]
+	if ok && w.want == got {
 		delete(c.waiters, id)
 	}
 	c.waitersMu.Unlock()
-	if ok {
-		select {
-		case ch <- res:
-		default:
-		}
+	if !ok {
+		return false
 	}
-	return ok
+	if w.want != got {
+		c.logger.Warn("mqtt.tcp.ack_class_mismatch",
+			slog.Uint64("packet_id", uint64(id)),
+			slog.String("got", got.String()), slog.String("want", w.want.String()))
+		return true
+	}
+	select {
+	case w.ch <- res:
+	default:
+	}
+	return true
 }
 
 // failAllWaiters resolves every outstanding waiter with [ErrConnectionLost]
@@ -645,9 +835,9 @@ func (c *TCPClient) signalWaiter(id uint16, res ackResult) bool {
 // parks forever on a dead socket.
 func (c *TCPClient) failAllWaiters() {
 	c.waitersMu.Lock()
-	for id, ch := range c.waiters {
+	for id, w := range c.waiters {
 		select {
-		case ch <- ackResult{err: ErrConnectionLost}:
+		case w.ch <- ackResult{err: ErrConnectionLost}:
 		default:
 		}
 		delete(c.waiters, id)
@@ -720,12 +910,24 @@ func (c *TCPClient) restoreSubscription(filter string, prev subscription, existe
 	c.subs = append(c.subs[:idx], c.subs[idx+1:]...)
 }
 
-// removeSubscription drops the registration for filter, if any.
-func (c *TCPClient) removeSubscription(filter string) {
+// removeSubscriptionIfCurrent drops the registration for filter only while
+// its token still matches the snapshot the caller took before its
+// UNSUBSCRIBE hit the wire. This mirrors restoreSubscription's guard: a
+// concurrent Subscribe for the same filter that registered after the
+// snapshot bumped the token, and its live registration — which the broker
+// is delivering to — must not be clobbered by the older Unsubscribe
+// resolving late. A residual window remains for a Subscribe whose token was
+// bumped before the snapshot but whose SUBSCRIBE frame serialised after the
+// UNSUBSCRIBE on the wire; closing it fully would require stamping tokens
+// under link.sendMu at write time, which is not worth the coupling.
+func (c *TCPClient) removeSubscriptionIfCurrent(filter string, token uint64) {
 	c.subsMu.Lock()
 	defer c.subsMu.Unlock()
 	for i := range c.subs {
 		if c.subs[i].filter == filter {
+			if c.subs[i].token != token {
+				return
+			}
 			c.subs = append(c.subs[:i], c.subs[i+1:]...)
 			return
 		}
@@ -913,6 +1115,16 @@ func (c *TCPClient) dial(ctx context.Context, u *url.URL) (net.Conn, error) {
 		host = net.JoinHostPort(u.Hostname(), port)
 	}
 
+	if !tlsScheme && c.cfg.TLSConfig != nil {
+		// The scheme selects the transport, so the configured TLSConfig is
+		// unused and the connection — including the CONNECT credentials —
+		// crosses the wire in plaintext. Make the trust downgrade visible
+		// instead of silently ignoring an explicit security configuration.
+		c.logger.Warn("mqtt.tcp.tls_config_ignored",
+			slog.String("scheme", u.Scheme),
+			slog.String("hint", "use tls://, ssl:// or mqtts:// to enable TLS"))
+	}
+
 	dialer := &net.Dialer{}
 	conn, err := dialer.DialContext(ctx, "tcp", host)
 	if err != nil {
@@ -922,9 +1134,21 @@ func (c *TCPClient) dial(ctx context.Context, u *url.URL) (net.Conn, error) {
 		return conn, nil
 	}
 
-	tlsCfg := c.cfg.TLSConfig
+	// Clone the caller's config so per-connection adjustments never mutate
+	// shared state across reconnects; Clone(nil) is nil, covering the
+	// build-a-default case. An empty ServerName is filled from the broker
+	// URL: tls.Client does not infer it from the dialed address, and the
+	// natural CA-pinning config (RootCAs only) would otherwise fail every
+	// handshake with an error that steers operators toward
+	// InsecureSkipVerify — the exact trap NewClientTLSConfig documents as
+	// closed. With InsecureSkipVerify set this still restores SNI for
+	// virtual-hosting brokers, with no verification downside.
+	tlsCfg := c.cfg.TLSConfig.Clone()
 	if tlsCfg == nil {
-		tlsCfg = &tls.Config{ServerName: u.Hostname(), MinVersion: tls.VersionTLS12}
+		tlsCfg = &tls.Config{MinVersion: tls.VersionTLS12}
+	}
+	if tlsCfg.ServerName == "" {
+		tlsCfg.ServerName = u.Hostname()
 	}
 	tlsConn := tls.Client(conn, tlsCfg)
 	if err := tlsConn.HandshakeContext(ctx); err != nil {

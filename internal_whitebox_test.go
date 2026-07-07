@@ -70,7 +70,7 @@ func TestReplaySubscriptionsWriteFrameTooLargeSkipsWithWarn(t *testing.T) {
 
 	// The identifier must have been released on the failure path: it is
 	// acquirable again.
-	if _, err := c.ids.Acquire(); err != nil {
+	if _, _, err := c.ids.Acquire(); err != nil {
 		t.Fatalf("Acquire after a failed replay: %v", err)
 	}
 }
@@ -86,16 +86,16 @@ func TestAwaitResubscribeReturnsWhenStopAlreadyClosed(t *testing.T) {
 	l := &link{stop: make(chan struct{})}
 	close(l.stop)
 
-	id, err := c.ids.Acquire()
+	id, gen, err := c.ids.Acquire()
 	if err != nil {
 		t.Fatalf("acquire: %v", err)
 	}
-	ch := c.registerWaiter(id)
+	ch := c.registerWaiter(id, ackClassSuback)
 	l.wg.Add(1)
 
 	done := make(chan struct{})
 	go func() {
-		c.awaitResubscribe(l, id, "a/b", ch)
+		c.awaitResubscribe(l, id, gen, "a/b", ch)
 		close(done)
 	}()
 	select {

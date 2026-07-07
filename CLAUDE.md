@@ -115,11 +115,22 @@ e2e/gencert/             standalone `go run` program generating the e2e CA + ser
   `Connect` builds fresh and swaps in atomically — `readLoop`/
   `keepAliveLoop` each hold their own `*link` pointer, so there is no
   shared nil-able field for a reconnect to race against (see the lock
-  ordering comment on `TCPClient` before touching any of `quota.mu` /
-  `ids.mu` / `store.mu` / `waitersMu` / `link.sendMu`). `writeFrame`
-  encodes a whole packet into `link.buf` under `sendMu` before a single
-  `Write`+`Flush`, so a partial encode can never leave a truncated frame
-  on the wire.
+  ordering comment on `TCPClient` before touching any of `connMu` /
+  `quota.mu` / `ids.mu` / `store.mu` / `waitersMu` / `link.sendMu`;
+  `connMu` is outermost and serialises Connect/Disconnect end-to-end).
+  `writeFrame` encodes a whole packet into `link.buf` under `sendMu`
+  before a single `Write`+`Flush` bounded by an `AckTimeout` write
+  deadline, so a partial encode can never leave a truncated frame on
+  the wire and a broker that stops reading cannot wedge the send path
+  (a failed write/flush tears the link down — the stream may hold a
+  truncated frame). Ack waiters are typed by acknowledgement class
+  (`ackClass`), and `quota`/`idAllocator` releases are
+  generation-checked so a goroutine stalled across a reconnect cannot
+  corrupt the new session's accounting. Malformed inbound acks
+  (PUBACK/PUBREC/PUBCOMP/PUBREL/SUBACK/UNSUBACK) tear the connection
+  down per §4.13.1; only well-formed acks for unknown identifiers are
+  warn-and-continue. Session replay runs BEFORE the link pointer is
+  published, so new publishes cannot jump ahead of the DUP resend.
   - **QoS 2 + session resumption** (`session.go`): `SessionStore`
     (`Save`/`Delete`/`All`/`Reset`) persists in-flight `StoredPublish`/
     `StoredPubrel` (outbound) and `StoredInboundID` (inbound dedup)

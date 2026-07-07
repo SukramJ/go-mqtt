@@ -3,6 +3,110 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.0] - 2026-07-07
+
+Hardening release: a multi-agent adversarial audit across seven
+dimensions (concurrency, decoder robustness, resource exhaustion,
+spec conformance, error handling, TLS/trust boundaries, test gaps)
+produced 28 verified findings, all fixed below. No exported signatures
+changed; the behavior changes are confined to inputs/states that were
+already broken (malformed frames, misconfiguration, races).
+
+### Fixed
+
+- **Concurrent `Connect`/`Disconnect` TOCTOU.** Both calls are now
+  serialised end-to-end by an internal mutex, so two concurrent
+  `Connect` calls can no longer establish two live links sharing one
+  session state (double read loops, clobbered send quota, spurious
+  `ErrConnectionLost` on the healthy link), and `Disconnect` can no
+  longer report success while a concurrent `Connect` is mid-handshake.
+  `teardownLink` additionally refuses to fail the shared waiters/quota
+  when the link being torn down is not the current one.
+- **Cross-epoch quota/packet-id releases.** `quota` and the packet-id
+  allocator carry a generation counter, bumped on every reset. A
+  Publish/Subscribe goroutine that stalls across a teardown+reconnect
+  and then unwinds can no longer over-credit the send quota past the
+  broker's Receive Maximum or free a packet identifier the new session
+  handed to another exchange; its writeFrame-failure cleanup is skipped
+  wholesale when the session epoch has advanced (the state now belongs
+  to the resumed session's replay).
+- **Forged/mismatched acknowledgements.** Ack waiters are typed by
+  acknowledgement class (publish-ack / SUBACK / UNSUBACK). A SUBACK
+  carrying the packet identifier of an in-flight QoS>0 PUBLISH — a
+  hostile-broker data-integrity lie that previously resolved the
+  Publish as successful and leaked its quota permit — is now
+  warn-logged and ignored; the waiter resolves through the real ack or
+  its timeout.
+- **Resumed-session replay ordering.** Stored QoS>0 state and
+  resubscriptions are replayed *before* the link pointer is published,
+  so a concurrent `Publish` can no longer jump ahead of (or interleave
+  with) the DUP replay ([MQTT-4.4.0-1] / v5 §4.4). Until replay
+  completes, publishes keep failing fast with `ErrNotConnected`.
+- **`Lifecycle.Stop` racing `Start`'s first connect.** A `Stop` that
+  landed while the synchronous first connect was in flight could
+  return success and leave the session connected with no reconnect
+  loop. `Start` now detects the intervening `Stop`, disconnects the
+  just-established session and returns a "stopped during start" error.
+- **`Unsubscribe` clobbering a newer registration.** The local handler
+  removal is token-checked (mirroring the Subscribe rollback guard), so
+  a concurrent `Subscribe` for the same filter that registered while
+  the UNSUBSCRIBE was in flight keeps its live registration.
+- **Blocked-handler session poisoning.** A QoS 2 `MessageHandler` that
+  blocks across a teardown+reconnect no longer records its inbound
+  dedup entry into the next session's freshly reset store (which would
+  swallow a future QoS 2 message reusing the identifier as a
+  duplicate); QoS 1 acks are likewise skipped on a dead link.
+- **Caller-supplied `TLSConfig` with empty `ServerName`.** The config
+  is now cloned per connection and an empty `ServerName` is filled from
+  the broker URL, so the natural CA-pinning config (`RootCAs` only)
+  completes a *verified* handshake instead of failing with an error
+  that steers operators toward `InsecureSkipVerify`.
+- **Credential leak in the connected log.** `mqtt.tcp.connected` logs
+  the redacted broker URL (`url.Redacted()`), so a password embedded in
+  the URL userinfo no longer reaches the structured log stream on every
+  reconnect.
+
+### Changed
+
+- **Malformed acknowledgements are now fatal (spec §4.13.1).** A
+  PUBACK/PUBREC/PUBCOMP/PUBREL/SUBACK/UNSUBACK the codec cannot decode
+  closes the connection (DISCONNECT 0x81 on v5) instead of being
+  warn-logged and skipped — previously the in-flight exchange leaked
+  its stored entry, packet identifier and send-quota permit forever on
+  a long-lived connection. Well-formed acks for unknown identifiers are
+  still warn-and-continue.
+- **Write deadlines on every socket write.** `writeFrame` bounds each
+  write/flush with `AckTimeout`, and a failed write tears the link down
+  (a deadline can expire mid-frame, poisoning the stream). A zero-window
+  or half-open broker can no longer wedge `Publish` — and the keep-alive
+  watchdog with it — for the kernel's ~15-minute TCP retransmission
+  timeout while holding the send mutex.
+- **`DialTimeout` now truly bounds the whole connect.** One absolute
+  deadline covers the dial, TLS handshake, CONNECT flush *and* CONNACK
+  wait (previously the CONNECT write was unbounded and the CONNACK wait
+  added a second `DialTimeout` on top). Cancelling the caller's context
+  now aborts an in-flight CONNACK wait promptly — and `Connect` can no
+  longer succeed on a context the caller has already abandoned.
+- **No DISCONNECT on MQTT 3.1.1 protocol errors.** The v3 DISCONNECT is
+  defined as a clean disconnect that discards the Last Will
+  ([MQTT-3.14.4-3]); on a protocol-error teardown the client now closes
+  the socket abruptly instead, keeping the LWT armed. v5 behavior
+  (DISCONNECT 0x81) is unchanged.
+- **Inbound PUBLISH validation.** `protocol.DecodePublish` now rejects
+  (as `ErrMalformedPacket`, closing the connection) a QoS>0 PUBLISH
+  with a zero packet identifier, a topic containing `+`/`#`, and an
+  empty topic without a v5 topic alias — spec-malformed frames that
+  previously polluted the QoS 2 dedup state or reached handlers.
+- **Will topic validation.** `Connect` fails fast with a clear error on
+  a Will topic (or v5 Will response topic) that violates topic-name
+  rules, instead of emitting a malformed CONNECT that turns into a
+  silent reconnect loop.
+- **`TCPConfig.TLSConfig` on a non-TLS scheme warns.** A configured
+  `TLSConfig` combined with `tcp://`/`mqtt://` is an invisible
+  plaintext downgrade; the client now logs
+  `mqtt.tcp.tls_config_ignored` (the scheme still selects the
+  transport, unchanged).
+
 ## [1.1.0] - 2026-07-04
 
 ### Added
