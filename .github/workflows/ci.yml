@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.0
-      - uses: actions/setup-go@v6.5.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
@@ -60,7 +60,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7.0.0
-      - uses: actions/setup-go@v6.5.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
@@ -75,7 +75,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.0
-      - uses: actions/setup-go@v6.5.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
@@ -87,7 +87,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.0
-      - uses: actions/setup-go@v6.5.0
+      - uses: actions/setup-go@v7.0.0
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
