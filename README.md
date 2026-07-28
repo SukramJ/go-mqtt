@@ -171,6 +171,14 @@ make e2e-down    # stop and remove them
 See the [Development Commands](./CLAUDE.md#development-commands)
 section of `CLAUDE.md` for the full target list.
 
+## Contributing
+
+Contributions are welcome, including AI-assisted ones — but you remain
+responsible for everything you submit. See the
+[AI contribution policy](./AI_POLICY.md) before opening a pull request
+or issue; `make check` must pass regardless of how the code was
+written.
+
 ## Migrating from v0.x
 
 v1.0 defaults to MQTT 5.0, makes `Subscribe` block until SUBACK, and
