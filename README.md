@@ -30,7 +30,7 @@ duplicated as `internal/mqtt`.
 | Inbound topic aliases | v5 topic alias table resolved per connection (outbound aliasing is out of scope) |
 | Last Will and Testament | v3.1.1 topic/payload/QoS/retain; v5 adds will properties (delay interval, message expiry, content type, correlation data, user properties) |
 | TLS | `NewClientTLSConfig` helper — always sets `ServerName`, never defaults to `InsecureSkipVerify` |
-| Reconnect lifecycle | `Lifecycle`: exponential backoff + jitter, event-driven via `ConnectionLost()` (immediate reconnect + backoff reset on a detected drop, not just idle polling) |
+| Reconnect lifecycle | `Lifecycle`: exponential backoff + jitter, event-driven via `ConnectionLost()` (immediate reconnect + backoff reset on a drop of a connection that had been stable for `FlapWindow`, not just idle polling; a faster drop is treated as flapping and backs off instead) |
 | Dependencies | Zero third-party — standard library only, including tests |
 
 ## Packages
@@ -143,8 +143,11 @@ if errors.Is(err, mqtt.ErrCircuitOpen) {
 
 Ack timeouts, `ErrConnectionLost`, `ErrNotConnected` and broker
 rejects (`*ReasonError` with an error reason code) count as failures;
-caller-side context cancellation and local limit violations
-(`ErrPacketTooLarge`, `ErrPacketIDExhausted`) are neutral.
+caller-side context cancellation, local limit violations
+(`ErrPacketTooLarge`, `ErrPacketIDExhausted`), and client-side wire
+validation errors raised before any bytes reach the broker
+(`protocol.ErrProtocolViolation`, `protocol.ErrMalformedPacket`,
+`protocol.ErrStringTooLong`) are neutral.
 
 ## Testing
 

@@ -62,6 +62,7 @@ publish.go               Publish/Subscribe/Unsubscribe: ack waiting, flow-contro
 session.go               SessionStore interface + memStore, idAllocator (packet-id bitmap), quota (send-quota semaphore)
 lifecycle.go             Lifecycle + ConnectionNotifier — reconnect loop, event-driven via a Connector's ConnectionLost(), exponential backoff + jitter
 tls_config.go            NewClientTLSConfig — safe tls.Config construction (mandatory ServerName)
+breaker.go               Breaker: circuit-breaking Publisher decorator (epoch-guarded state machine, ErrCircuitOpen fail-fast)
 test_mock_broker.go      in-package (non-_test.go) scripted multi-connection mock broker (v3.1.1 + v5), fault injection knobs
 protocol/                package protocol: dual-version (v3.1.1 + v5) MQTT wire codec
 protocol/doc.go          package-level doc comment; precise feature coverage + deliberate omissions
@@ -173,11 +174,15 @@ e2e/gencert/             standalone `go run` program generating the e2e CA + ser
   hook, `errors.Is(err, ErrAlreadyConnected)` idempotency short-circuit,
   and — new in v1.0 — event-driven reconnect: if the `Connector` also
   implements `ConnectionNotifier` (`TCPClient` does), `loop()` selects
-  on its `ConnectionLost()` channel alongside the jittered timer and
-  reconnects immediately (backoff reset to `InitialBackoff`) instead of
-  only noticing on the next timer tick. `Start`'s `ctx` governs the
-  *whole* reconnect loop, not just the first connect — pass a long-lived
-  context, not a short one.
+  on its `ConnectionLost()` channel alongside the jittered timer. A drop
+  of a connection that had been up for at least `FlapWindow` (default
+  10s) reconnects immediately with the backoff reset to
+  `InitialBackoff`; a drop sooner than that counts as flapping (e.g. a
+  broker that accepts the CONNECT and immediately closes the socket) and
+  instead waits out a delay that doubles with each consecutive flap, up
+  to `MaxBackoff`, so the loop cannot hammer a flapping broker at full
+  dial speed. `Start`'s `ctx` governs the *whole* reconnect loop, not
+  just the first connect — pass a long-lived context, not a short one.
 - **`MessageHandler` contract**: `func(msg *Message)`. Handlers run
   **synchronously inline** in `TCPClient.readLoop` — the same goroutine
   that also decodes PUBACK/PUBREC/PUBCOMP/PINGRESP and feeds the
@@ -214,7 +219,7 @@ make tidy          # go mod tidy
 make check         # vet + fmt-check + lint + test — the pre-commit/pre-push gate
 make fuzz-smoke    # 10s per ./protocol Fuzz target (CI smoke gate)
 make fuzz          # FUZZTIME per ./protocol Fuzz target (default 5m; local/periodic)
-make e2e-certs     # generate the e2e CA + server TLS cert (idempotent, gitignored output)
+make e2e-certs     # generate the e2e CA + server TLS cert (idempotent unless expired/expiring soon, gitignored output)
 make e2e-up        # start the e2e mosquitto (plain/TLS/password listeners) + EMQX containers
 make e2e-down      # stop and remove them
 make test-e2e      # run ./e2e against the containers started by e2e-up (env-var gated, auto-skips without a broker)
@@ -253,10 +258,10 @@ Run a single package's tests directly, e.g. `go test ./protocol/...`.
   `InjectRawFrame` (server-initiated traffic and malformed frames),
   `InjectTCPReset` (simulated abrupt TCP close), and
   `DropPings`/`DropNextPings` (half-open socket simulation exercising
-  the PINGRESP watchdog). `review_round1_test.go`/
-  `review_round2_test.go` (root and `protocol/`) are regression tests
-  for confirmed adversarial-review findings — read them before
-  touching the code paths they cover.
+  the PINGRESP watchdog). `review_round*_test.go` (root and
+  `protocol/`, currently rounds 1-4) are regression tests for confirmed
+  adversarial-review findings — read them before touching the code
+  paths they cover.
 - **E2E** (`e2e/`, no build tag — always compiled and vetted/linted,
   just skipped at runtime): scenario tests against real mosquitto and
   EMQX brokers over Docker, gated by `MQTT_E2E_MOSQUITTO`/
@@ -265,11 +270,11 @@ Run a single package's tests directly, e.g. `go test ./protocol/...`.
   broker is reachable. Covers both protocol versions, TLS (pinned CA),
   password auth, QoS 0/1/2, retained replay, LWT (incl. v5 will
   properties) after a hard socket kill, session resumption across a
-  simulated broker "restart" (an in-test TCP proxy, so broker-side
-  session/retained state survives — real `docker restart` is also
-  available behind `MQTT_E2E_ALLOW_DOCKER_CONTROL=1`, CI-only), Server
-  Keep Alive override, and v5 extras (user properties, message expiry,
-  inbound topic alias, Receive Maximum back-pressure).
+  simulated broker "restart" (an in-test TCP proxy that drops and
+  re-accepts the TCP connection, so broker-side session/retained state
+  survives — there is no real `docker restart` path), Server Keep Alive
+  override, and v5 extras (user properties, message expiry, inbound
+  topic alias, Receive Maximum back-pressure).
 - **Coverage gate**: `make cover-check` fails if any non-`e2e` package
   drops below `COVER_MIN` (default 90%); it parses `go tool cover
   -func` per package, not a merged total, so one weak package can't
@@ -316,8 +321,8 @@ Run a single package's tests directly, e.g. `go test ./protocol/...`.
   `./protocol` Fuzz target, ubuntu), `e2e` (ubuntu-only — macOS/Windows
   runners have no Docker — starts mosquitto + EMQX via `make e2e-up`,
   which blocks until both brokers log readiness, runs `make test-e2e`,
-  dumps container logs on failure). A separate `codeql.yml` runs CodeQL
-  SAST on push/PR/weekly schedule; `dependabot-auto-merge.yml`
+  unconditionally dumps container logs). A separate `codeql.yml` runs
+  CodeQL SAST on push/PR/weekly schedule; `dependabot-auto-merge.yml`
   auto-merges non-major Dependabot PRs; `release-on-tag.yml` creates a
   GitHub Release for every pushed tag with the matching `CHANGELOG.md`
   section as its body (and fails if that section is missing) — a
@@ -342,9 +347,13 @@ discussion, they were explicitly scoped out:
   the next reconnect.
 - **A WebSocket transport.** Only `tcp://`/`tls://` (`mqtt://`,
   `ssl://`, `mqtts://` aliases) are dialed.
-- **A shared-subscription helper.** `$share/...` filter syntax passes
-  through the wire codec untouched; there is no client-side API sugar
-  for it.
+- **A shared-subscription helper.** `$share/{ShareName}/{filter}`
+  (§4.8.2) filters are understood by `protocol.MatchTopic` (matches
+  against the wrapped filter, `$share/{ShareName}/` prefix stripped)
+  and validated structurally by `protocol.ValidateTopicFilter`, and
+  pass through the wire codec untouched; there is still no client-side
+  API sugar (e.g. a helper to build the filter or split incoming
+  messages by share group).
 
 ## Consumers and Compatibility
 
@@ -358,7 +367,8 @@ implications:
 - Follow SemVer discipline strictly. Any change to an exported
   signature in `client.go`, `options.go`, `errors.go`, `adapter_tcp.go`,
   `pump.go`, `publish.go`, `session.go`, `lifecycle.go`, `tls_config.go`,
-  or `protocol/` is a breaking change unless it is purely additive.
+  `breaker.go`, or `protocol/` is a breaking change unless it is purely
+  additive.
 - Before changing behavior (not just signatures) — e.g. the PINGRESP
   watchdog timing, the resubscribe-on-reconnect behavior, the
   fail-fast-on-disconnect contract, the flow-control quota accounting,

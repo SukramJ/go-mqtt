@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2026 SukramJ
+# Copyright (C) 2026 OpenCCU-Loom authors.
 #
 # pre-commit — runs format + build + vet + lint + fast tests against the
 # staged Go changes. Wired up by `make setup` / `make hooks` via
