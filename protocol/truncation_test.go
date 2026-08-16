@@ -110,7 +110,10 @@ func TestDecodeTruncationExhaustive(t *testing.T) {
 		})
 
 		var v5 bytes.Buffer
-		v5.WriteByte(0x01) // session present
+		// Session Present must be 0 alongside a failure reason code
+		// ([MQTT-3.2.2-4]), so the property-rich body pairs the refusal with
+		// clear acknowledge flags.
+		v5.WriteByte(0x00)
 		v5.WriteByte(byte(BadUserNameOrPassword))
 		if err := mergedProps(tgConnack).encode(&v5, tgConnack); err != nil {
 			t.Fatalf("encode props: %v", err)

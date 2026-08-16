@@ -64,10 +64,18 @@ type SubscribePacket struct {
 	Properties    *Properties
 }
 
-// Encode writes the SUBSCRIBE packet to w. It must carry at least one
+// Encode writes the SUBSCRIBE packet to w. It must carry a supported
+// [Version], a non-zero packet identifier ([MQTT-2.2.1-3]) and at least one
 // subscription (MQTT 5.0 §3.8.3); otherwise [ErrProtocolViolation]. Illegal
-// options or properties surface [ErrProtocolViolation] from their encoders.
+// options or properties — including more than one Subscription Identifier
+// (§3.8.2.1.2) — surface [ErrProtocolViolation] from their encoders.
 func (p *SubscribePacket) Encode(w io.Writer) error {
+	if !p.Version.Valid() {
+		return fmt.Errorf("%w: unsupported protocol version %d", ErrProtocolViolation, byte(p.Version))
+	}
+	if p.PacketID == 0 {
+		return fmt.Errorf("%w: SUBSCRIBE with zero packet identifier", ErrProtocolViolation)
+	}
 	if len(p.Subscriptions) == 0 {
 		return fmt.Errorf("%w: SUBSCRIBE with no subscriptions", ErrProtocolViolation)
 	}
@@ -108,11 +116,54 @@ type SubackPacket struct {
 	Properties  *Properties
 }
 
+// subackReasonV311 is the closed set of MQTT 3.1.1 SUBACK return codes
+// (§3.9.3): granted QoS 0/1/2 and the single failure code 0x80. Anything
+// else on the wire is a Malformed Packet, not a mysterious "granted QoS 3".
+var subackReasonV311 = map[byte]bool{
+	0x00: true, // Success - Maximum QoS 0
+	0x01: true, // Success - Maximum QoS 1
+	0x02: true, // Success - Maximum QoS 2
+	0x80: true, // Failure
+}
+
+// subackReasonV50 is the closed set of MQTT 5.0 SUBACK reason codes
+// (§3.9.3): the three grants plus the failure codes a server may return
+// for a subscription.
+var subackReasonV50 = map[byte]bool{
+	0x00: true, // Granted QoS 0
+	0x01: true, // Granted QoS 1
+	0x02: true, // Granted QoS 2
+	0x80: true, // Unspecified error
+	0x83: true, // Implementation specific error
+	0x87: true, // Not authorized
+	0x8F: true, // Topic Filter invalid
+	0x91: true, // Packet Identifier in use
+	0x97: true, // Quota exceeded
+	0x9E: true, // Shared Subscriptions not supported
+	0xA1: true, // Subscription Identifiers not supported
+	0xA2: true, // Wildcard Subscriptions not supported
+}
+
+// unsubackReasonV50 is the closed set of MQTT 5.0 UNSUBACK reason codes
+// (§3.11.3). MQTT 3.1.1 UNSUBACK carries no reason codes at all.
+var unsubackReasonV50 = map[byte]bool{
+	0x00: true, // Success
+	0x11: true, // No subscription existed
+	0x80: true, // Unspecified error
+	0x83: true, // Implementation specific error
+	0x87: true, // Not authorized
+	0x8F: true, // Topic Filter invalid
+	0x91: true, // Packet Identifier in use
+}
+
 // DecodeSuback decodes a SUBACK body for protocol version v: a packet
 // identifier, a [V50]-only property block, then one reason code byte per
-// subscription. At least one reason code is required (MQTT 5.0 §3.9.3). Any
-// truncation, illegal property or empty payload yields an error wrapping
-// [ErrMalformedPacket]; decoding never panics.
+// subscription. At least one reason code is required (MQTT 5.0 §3.9.3), the
+// packet identifier must be non-zero ([MQTT-2.2.1-3]) and every reason code
+// must be one the version defines (see [subackReasonV311] /
+// [subackReasonV50]). Any truncation, illegal property, out-of-range reason
+// code or empty payload yields an error wrapping [ErrMalformedPacket];
+// decoding never panics.
 func DecodeSuback(v Version, body []byte) (*SubackPacket, error) {
 	p := &SubackPacket{}
 	c := newCursor(body)
@@ -120,6 +171,9 @@ func DecodeSuback(v Version, body []byte) (*SubackPacket, error) {
 	pid, err := c.readUint16()
 	if err != nil {
 		return nil, err
+	}
+	if pid == 0 {
+		return nil, wrapMalformed("SUBACK with zero packet identifier")
 	}
 	p.PacketID = pid
 
@@ -140,10 +194,17 @@ func DecodeSuback(v Version, body []byte) (*SubackPacket, error) {
 	if c.remaining() == 0 {
 		return nil, wrapMalformed("SUBACK with no reason codes")
 	}
+	allowed := subackReasonV50
+	if v == V311 {
+		allowed = subackReasonV311
+	}
 	for c.remaining() > 0 {
 		rc, err := c.readByte()
 		if err != nil {
 			return nil, err
+		}
+		if !allowed[rc] {
+			return nil, fmt.Errorf("%w: SUBACK reason code 0x%02X undefined for %s", ErrMalformedPacket, rc, v)
 		}
 		p.ReasonCodes = append(p.ReasonCodes, ReasonCode(rc))
 	}
@@ -161,10 +222,17 @@ type UnsubscribePacket struct {
 	Properties *Properties
 }
 
-// Encode writes the UNSUBSCRIBE packet to w. It must carry at least one
+// Encode writes the UNSUBSCRIBE packet to w. It must carry a supported
+// [Version], a non-zero packet identifier ([MQTT-2.2.1-3]) and at least one
 // filter (MQTT 5.0 §3.10.3); otherwise [ErrProtocolViolation]. Illegal
 // properties surface [ErrProtocolViolation] from the property encoder.
 func (p *UnsubscribePacket) Encode(w io.Writer) error {
+	if !p.Version.Valid() {
+		return fmt.Errorf("%w: unsupported protocol version %d", ErrProtocolViolation, byte(p.Version))
+	}
+	if p.PacketID == 0 {
+		return fmt.Errorf("%w: UNSUBSCRIBE with zero packet identifier", ErrProtocolViolation)
+	}
 	if len(p.Filters) == 0 {
 		return fmt.Errorf("%w: UNSUBSCRIBE with no filters", ErrProtocolViolation)
 	}
@@ -201,9 +269,11 @@ type UnsubackPacket struct {
 // DecodeUnsuback decodes an UNSUBACK body for protocol version v. A [V311]
 // UNSUBACK is exactly the two-byte packet identifier (no reason codes). A
 // [V50] UNSUBACK adds a property block and one reason code byte per filter
-// (at least one). Any truncation, trailing byte, illegal property or empty
-// [V50] payload yields an error wrapping [ErrMalformedPacket]; decoding
-// never panics.
+// (at least one), each of which must be defined for UNSUBACK (see
+// [unsubackReasonV50]). Any truncation, trailing byte, illegal property,
+// zero packet identifier ([MQTT-2.2.1-3]), out-of-range reason code or
+// empty [V50] payload yields an error wrapping [ErrMalformedPacket];
+// decoding never panics.
 func DecodeUnsuback(v Version, body []byte) (*UnsubackPacket, error) {
 	p := &UnsubackPacket{}
 	c := newCursor(body)
@@ -211,6 +281,9 @@ func DecodeUnsuback(v Version, body []byte) (*UnsubackPacket, error) {
 	pid, err := c.readUint16()
 	if err != nil {
 		return nil, err
+	}
+	if pid == 0 {
+		return nil, wrapMalformed("UNSUBACK with zero packet identifier")
 	}
 	p.PacketID = pid
 
@@ -233,6 +306,9 @@ func DecodeUnsuback(v Version, body []byte) (*UnsubackPacket, error) {
 			rc, err := c.readByte()
 			if err != nil {
 				return nil, err
+			}
+			if !unsubackReasonV50[rc] {
+				return nil, fmt.Errorf("%w: UNSUBACK reason code 0x%02X undefined", ErrMalformedPacket, rc)
 			}
 			p.ReasonCodes = append(p.ReasonCodes, ReasonCode(rc))
 		}

@@ -94,7 +94,9 @@ func TestPublishRejectsRetainWhenUnavailable(t *testing.T) {
 
 // TestConnectRejectsZeroReceiveMaximum proves a CONNACK advertising Receive
 // Maximum = 0 (a §3.2.2.3.3 Protocol Error) fails the connect instead of
-// seeding a zero send quota that would hang every QoS>0 Publish.
+// seeding a zero send quota that would hang every QoS>0 Publish. The
+// property decoder rejects the value as ErrMalformedPacket before
+// validateConnackLimits (kept as defence in depth) ever runs.
 func TestConnectRejectsZeroReceiveMaximum(t *testing.T) {
 	t.Parallel()
 
@@ -105,8 +107,8 @@ func TestConnectRejectsZeroReceiveMaximum(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := c.Connect(ctx); !errors.Is(err, protocol.ErrProtocolViolation) {
-		t.Fatalf("Connect err = %v, want ErrProtocolViolation", err)
+	if err := c.Connect(ctx); !errors.Is(err, protocol.ErrMalformedPacket) {
+		t.Fatalf("Connect err = %v, want ErrMalformedPacket", err)
 	}
 	if c.IsConnected() {
 		t.Fatal("client reports connected after refusing a zero Receive Maximum")
@@ -125,8 +127,8 @@ func TestConnectRejectsZeroMaximumPacketSize(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := c.Connect(ctx); !errors.Is(err, protocol.ErrProtocolViolation) {
-		t.Fatalf("Connect err = %v, want ErrProtocolViolation", err)
+	if err := c.Connect(ctx); !errors.Is(err, protocol.ErrMalformedPacket) {
+		t.Fatalf("Connect err = %v, want ErrMalformedPacket", err)
 	}
 	if c.IsConnected() {
 		t.Fatal("client reports connected after refusing a zero Maximum Packet Size")

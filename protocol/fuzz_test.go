@@ -48,7 +48,10 @@ func varintBytes(v uint32) []byte {
 func connackV5Body(tb testing.TB) []byte {
 	tb.Helper()
 	var buf bytes.Buffer
-	buf.WriteByte(0x01) // session present
+	// Session Present stays 0: pairing it with a failure reason code is a
+	// [MQTT-3.2.2-4] violation the decoder rejects, which would make this a
+	// seed that never reaches the property block.
+	buf.WriteByte(0x00)
 	buf.WriteByte(byte(BadUserNameOrPassword))
 	if err := mergedProps(tgConnack).encode(&buf, tgConnack); err != nil {
 		tb.Fatalf("connackV5Body: %v", err)

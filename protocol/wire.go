@@ -109,16 +109,22 @@ func (f Frame) PacketType() PacketType { return PacketType(f.Header >> 4) }
 // ValidateFlags checks the reserved fixed-header flag bits (the low
 // nibble) against the packet type, per MQTT 5.0 §2.1.3 / 3.1.1 §2.2.2.
 // PUBREL, SUBSCRIBE and UNSUBSCRIBE require the bit pattern 0b0010;
-// PUBLISH carries DUP/QoS/RETAIN bits but QoS 3 is illegal; every other
-// packet requires all flag bits clear. A malformed nibble (or an
-// unknown/reserved packet type) yields an error wrapping
-// [ErrMalformedPacket].
+// PUBLISH carries DUP/QoS/RETAIN bits but QoS 3 is illegal and DUP must be
+// 0 at QoS 0 [MQTT-3.3.1-2]; every other packet requires all flag bits
+// clear. A malformed nibble (or an unknown/reserved packet type) yields an
+// error wrapping [ErrMalformedPacket].
 func (f Frame) ValidateFlags() error {
 	flags := f.Header & 0x0F
 	switch f.PacketType() {
 	case Publish:
-		if (flags>>1)&0x03 == 0x03 {
+		qos := (flags >> 1) & 0x03
+		if qos == 0x03 {
 			return wrapMalformed("PUBLISH with QoS 3")
+		}
+		// [MQTT-3.3.1-2]: the DUP flag MUST be 0 for a QoS 0 PUBLISH —
+		// there is no redelivery at QoS 0, so header 0x38 is malformed.
+		if qos == 0 && flags&0x08 != 0 {
+			return wrapMalformed("PUBLISH with DUP set at QoS 0")
 		}
 		return nil
 	case Pubrel, Subscribe, Unsubscribe:
@@ -137,13 +143,16 @@ func (f Frame) ValidateFlags() error {
 	}
 }
 
-// ReadFrame reads exactly one MQTT packet from r. maxRemainingLength
-// caps the advertised remaining length (the client wires this to the
-// negotiated MaximumPacketSize); a frame exceeding it fails with
-// [ErrFrameTooLarge] before any body buffer is allocated, so a hostile
-// length field cannot force a large allocation. A short/erroring reader
-// surfaces the reader's error (io.EOF / io.ErrUnexpectedEOF).
-func ReadFrame(r io.Reader, maxRemainingLength uint32) (Frame, error) {
+// ReadFrame reads exactly one MQTT packet from r. maxPacketSize caps the
+// TOTAL packet size as MQTT 5.0 §2.1.4 defines it — the fixed-header byte
+// plus the remaining-length variable byte integer plus the remaining
+// length itself — which is exactly the quantity the Maximum Packet Size
+// property advertises, so the client can wire its negotiated value
+// straight through. A frame exceeding it fails with [ErrFrameTooLarge]
+// before any body buffer is allocated, so a hostile length field cannot
+// force a large allocation. A short/erroring reader surfaces the reader's
+// error (io.EOF / io.ErrUnexpectedEOF).
+func ReadFrame(r io.Reader, maxPacketSize uint32) (Frame, error) {
 	var head [1]byte
 	if _, err := io.ReadFull(r, head[:]); err != nil {
 		return Frame{}, err
@@ -152,8 +161,14 @@ func ReadFrame(r io.Reader, maxRemainingLength uint32) (Frame, error) {
 	if err != nil {
 		return Frame{}, err
 	}
-	if length > maxRemainingLength {
-		return Frame{}, fmt.Errorf("%w: %d > %d", ErrFrameTooLarge, length, maxRemainingLength)
+	// The fixed header costs one byte plus the (minimal, per readVarintFrom)
+	// remaining-length varint. Subtracting it from the cap rather than adding
+	// it to length keeps the comparison free of overflow, and the first
+	// clause guards the underflow when the cap is smaller than the header
+	// itself (every packet then exceeds it).
+	overhead := uint32(1 + varintLen(length)) //nolint:gosec // varintLen returns 1..4
+	if maxPacketSize < overhead || length > maxPacketSize-overhead {
+		return Frame{}, fmt.Errorf("%w: %d > %d", ErrFrameTooLarge, uint64(overhead)+uint64(length), maxPacketSize)
 	}
 	body := make([]byte, length)
 	if length > 0 {
@@ -187,7 +202,8 @@ func writePacket(w io.Writer, header byte, body []byte) error {
 
 // readVarintFrom decodes an MQTT variable byte integer directly from a
 // stream (used for the fixed-header remaining length). It reads at most
-// four bytes; a fifth continuation bit is malformed.
+// four bytes; a fifth continuation bit is malformed, as is a non-minimal
+// encoding (see [nonMinimalVarint]).
 func readVarintFrom(r io.Reader) (uint32, error) {
 	var value uint32
 	var b [1]byte
@@ -197,10 +213,38 @@ func readVarintFrom(r io.Reader) (uint32, error) {
 		}
 		value |= uint32(b[0]&0x7F) << (7 * i)
 		if b[0]&0x80 == 0 {
+			if nonMinimalVarint(i, b[0]) {
+				return 0, fmt.Errorf("%w: non-minimal variable byte integer", ErrMalformedPacket)
+			}
 			return value, nil
 		}
 	}
 	return 0, fmt.Errorf("%w: variable byte integer too long", ErrMalformedPacket)
+}
+
+// nonMinimalVarint reports whether a variable byte integer that terminated
+// on its (zero-based) byte index i with terminating byte last used more
+// bytes than necessary. [MQTT-1.5.5-1] fixes exactly one encoding per
+// value, so a terminating byte contributing nothing (0x00) after at least
+// one continuation byte — e.g. 0x81 0x00 for the value 1 — is a Malformed
+// Packet rather than an alternative spelling. Shared by both varint
+// readers so the stream and cursor paths cannot drift apart.
+func nonMinimalVarint(i int, last byte) bool { return i > 0 && last == 0x00 }
+
+// varintLen returns the number of bytes [appendVarint] uses for v, i.e.
+// the length of its one and only legal (minimal) encoding. v must be
+// <= maxVarint.
+func varintLen(v uint32) int {
+	switch {
+	case v < 1<<7:
+		return 1
+	case v < 1<<14:
+		return 2
+	case v < 1<<21:
+		return 3
+	default:
+		return 4
+	}
 }
 
 // appendVarint appends v to buf as an MQTT variable byte integer. v must
@@ -304,7 +348,9 @@ func (c *cursor) readUint32() (uint32, error) {
 }
 
 // readVarint reads an MQTT variable byte integer (property length,
-// subscription identifier). It consumes at most four bytes.
+// subscription identifier). It consumes at most four bytes, and rejects a
+// non-minimal encoding ([MQTT-1.5.5-1], see [nonMinimalVarint]) exactly as
+// the stream-side [readVarintFrom] does.
 func (c *cursor) readVarint() (uint32, error) {
 	var value uint32
 	for i := range 4 {
@@ -314,6 +360,9 @@ func (c *cursor) readVarint() (uint32, error) {
 		}
 		value |= uint32(b&0x7F) << (7 * i)
 		if b&0x80 == 0 {
+			if nonMinimalVarint(i, b) {
+				return 0, wrapMalformed("non-minimal variable byte integer")
+			}
 			return value, nil
 		}
 	}

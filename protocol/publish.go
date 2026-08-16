@@ -27,17 +27,27 @@ type PublishPacket struct {
 	Properties *Properties
 }
 
-// Encode writes the PUBLISH packet to w. A QoS above 2 yields
-// [ErrProtocolViolation]; a QoS 1 or 2 message with a zero packet
-// identifier likewise (MQTT 5.0 §2.2.1). Properties illegal for PUBLISH
-// surface [ErrProtocolViolation] from the property encoder. For [V311] no
-// property block is written.
+// Encode writes the PUBLISH packet to w. An unsupported [Version], a QoS
+// above 2, a QoS 1 or 2 message with a zero packet identifier
+// ([MQTT-2.2.1-3]) and DUP set on a QoS 0 message ([MQTT-3.3.1-2]) all
+// yield [ErrProtocolViolation]. Properties illegal for PUBLISH — including
+// a Topic Alias of 0 (§3.3.2.3.4) — surface [ErrProtocolViolation] from the
+// property encoder. For [V311] no property block is written.
 func (p *PublishPacket) Encode(w io.Writer) error {
+	if !p.Version.Valid() {
+		return fmt.Errorf("%w: unsupported protocol version %d", ErrProtocolViolation, byte(p.Version))
+	}
 	if p.QoS > 2 {
 		return fmt.Errorf("%w: PUBLISH QoS %d", ErrProtocolViolation, p.QoS)
 	}
 	if p.QoS > 0 && p.PacketID == 0 {
 		return fmt.Errorf("%w: PUBLISH QoS %d with zero packet identifier", ErrProtocolViolation, p.QoS)
+	}
+	// [MQTT-3.3.1-2]: DUP is meaningless at QoS 0 (nothing is redelivered)
+	// and MUST be 0 there — refuse to put header 0x38 on the wire, which
+	// this package's own decoder (and any conformant peer) rejects.
+	if p.QoS == 0 && p.Dup {
+		return fmt.Errorf("%w: PUBLISH with DUP set at QoS 0", ErrProtocolViolation)
 	}
 
 	header := byte(Publish) << 4
@@ -70,19 +80,27 @@ func (p *PublishPacket) Encode(w io.Writer) error {
 
 // DecodePublish decodes a PUBLISH packet for protocol version v. header is
 // the fixed-header byte (DUP/QoS/RETAIN live in its low nibble); body is
-// the remaining bytes. A QoS of 3, a QoS 1/2 packet with a zero packet
-// identifier ([MQTT-2.2.1-2]), a topic name containing a wildcard
-// character ([MQTT-3.3.2-2]) and an empty topic name (legal only on [V50]
-// when a Topic Alias property resolves it, §3.3.2.1) are all illegal and
-// yield [ErrMalformedPacket]. For [V50] a property block follows the packet
-// identifier. The payload is whatever bytes remain after the variable
-// header. Any truncation or illegal property yields an error wrapping
-// [ErrMalformedPacket]; decoding never panics.
+// the remaining bytes. A QoS of 3, DUP set at QoS 0 ([MQTT-3.3.1-2]), a
+// QoS 1/2 packet with a zero packet identifier ([MQTT-2.2.1-2]), a topic
+// name containing a wildcard character ([MQTT-3.3.2-2]) and an empty topic
+// name (legal only on [V50] when a Topic Alias property resolves it,
+// §3.3.2.1) are all illegal and yield [ErrMalformedPacket]. For [V50] a
+// property block follows the packet identifier; an unsupported version
+// yields [ErrProtocolViolation] rather than silently decoding v5 property
+// bytes as payload. The payload is whatever bytes remain after the
+// variable header. Any truncation or illegal property yields an error
+// wrapping [ErrMalformedPacket]; decoding never panics.
 func DecodePublish(v Version, header byte, body []byte) (*PublishPacket, error) {
 	flags := header & 0x0F
 	qos := (flags >> 1) & 0x03
 	if qos == 3 {
 		return nil, wrapMalformed("PUBLISH with QoS 3")
+	}
+	// [MQTT-3.3.1-2]: DUP MUST be 0 for a QoS 0 PUBLISH. Frame.ValidateFlags
+	// catches this on the read hot path; repeated here for callers that
+	// decode a body without going through it.
+	if qos == 0 && flags&0x08 != 0 {
+		return nil, wrapMalformed("PUBLISH with DUP set at QoS 0")
 	}
 
 	p := &PublishPacket{
@@ -113,14 +131,24 @@ func DecodePublish(v Version, header byte, body []byte) (*PublishPacket, error) 
 		p.PacketID = id
 	}
 
-	if v == V50 {
+	switch v {
+	case V311:
+		// MQTT 3.1.1 PUBLISH carries no property block; the payload follows
+		// the packet identifier directly.
+	case V50:
 		props, err := decodeProperties(c, tgPublish)
 		if err != nil {
 			return nil, err
 		}
 		p.Properties = props
+	default:
+		return nil, fmt.Errorf("%w: unsupported protocol version %d", ErrProtocolViolation, byte(v))
 	}
 
+	// §3.3.2.1: an empty topic name is legal only on a [V50] link that
+	// resolves it through a Topic Alias. decodeProperties has already
+	// rejected an alias of 0 (§3.3.2.3.4), so a non-nil TopicAlias here is
+	// necessarily a usable (1..65535) alias — presence is the whole test.
 	if topic == "" && (v != V50 || p.Properties == nil || p.Properties.TopicAlias == nil) {
 		return nil, wrapMalformed("PUBLISH with empty topic and no topic alias")
 	}
@@ -170,16 +198,25 @@ func ackTarget(t PacketType) (propTarget, bool) {
 }
 
 // EncodeAck writes the acknowledgement packet to w. Type must be one of
-// PUBACK/PUBREC/PUBREL/PUBCOMP; any other yields [ErrProtocolViolation].
-// For [V311] the body is exactly the packet identifier. For [V50] the
-// reason code and property block are omitted when the reason code is 0x00
-// (Success) and there are no properties (the spec short form); a non-zero
-// reason with no properties writes a three-byte body; properties force the
-// full form. PUBREL is written with fixed-header flags 0x02.
+// PUBACK/PUBREC/PUBREL/PUBCOMP; any other yields [ErrProtocolViolation], as
+// do an unsupported [Version] and a zero packet identifier
+// ([MQTT-2.2.1-3]). For [V311] the body is exactly the packet identifier.
+// For [V50] the reason code and property block are omitted when the reason
+// code is 0x00 (Success) and there are no properties (the spec short form);
+// a non-zero reason with no properties writes a three-byte body; properties
+// force the full form. PUBREL is written with fixed-header flags 0x02.
 func (p *AckPacket) EncodeAck(w io.Writer) error {
+	if !p.Version.Valid() {
+		return fmt.Errorf("%w: unsupported protocol version %d", ErrProtocolViolation, byte(p.Version))
+	}
 	target, ok := ackTarget(p.Type)
 	if !ok {
 		return fmt.Errorf("%w: %s is not an acknowledgement packet", ErrProtocolViolation, p.Type)
+	}
+	// [MQTT-2.2.1-3]: every packet with a packet identifier must carry a
+	// non-zero one — an acknowledgement always does.
+	if p.PacketID == 0 {
+		return fmt.Errorf("%w: %s with zero packet identifier", ErrProtocolViolation, p.Type)
 	}
 
 	header := byte(p.Type) << 4
@@ -209,8 +246,9 @@ func (p *AckPacket) EncodeAck(w io.Writer) error {
 // [V311] two-byte form (packet identifier only) and all three [V50] forms:
 // two bytes (reason 0x00, no properties), three bytes (reason code, no
 // properties), and the full form with a property block. Any truncation,
-// trailing byte, illegal property or non-acknowledgement type yields an
-// error wrapping [ErrMalformedPacket]; decoding never panics.
+// trailing byte, illegal property, zero packet identifier ([MQTT-2.2.1-3])
+// or non-acknowledgement type yields an error wrapping
+// [ErrMalformedPacket]; decoding never panics.
 func DecodeAck(v Version, t PacketType, body []byte) (*AckPacket, error) {
 	target, ok := ackTarget(t)
 	if !ok {
@@ -223,6 +261,9 @@ func DecodeAck(v Version, t PacketType, body []byte) (*AckPacket, error) {
 	pid, err := c.readUint16()
 	if err != nil {
 		return nil, err
+	}
+	if pid == 0 {
+		return nil, wrapMalformed("acknowledgement with zero packet identifier")
 	}
 	p.PacketID = pid
 
