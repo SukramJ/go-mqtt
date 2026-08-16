@@ -48,12 +48,18 @@
 //   - Topic name/filter validation and wildcard matching ([MatchTopic],
 //     [ValidateTopicName], [ValidateTopicFilter]), including the §4.7.1.2
 //     parent-level match (`a/#` matches `a`) and the rule that a wildcard
-//     filter never matches a topic starting with `$`.
+//     filter never matches a topic starting with `$`. Shared-subscription
+//     filters (`$share/{ShareName}/{filter}`, §4.8.2) are validated
+//     structurally and matched against the real topic a PUBLISH carries,
+//     with the `$share/{ShareName}/` prefix stripped before matching.
 //
 // Deliberately out of scope (see the module's CLAUDE.md for the full
 // rationale): sending AUTH / participating in enhanced re-authentication
 // (AUTH is decoded only, so the adapter can reject it); outbound topic
 // aliasing (inbound alias resolution is a root-package, not protocol,
-// concern); any transport beyond what the root package builds on this
-// codec (no WebSocket framing here).
+// concern); client-side API sugar for shared subscriptions (the `$share/`
+// filter syntax is understood by [MatchTopic] / [ValidateTopicFilter] and
+// passes through the codec untouched, but there is no helper that builds
+// or manages one); any transport beyond what the root package builds on
+// this codec (no WebSocket framing here).
 package protocol
