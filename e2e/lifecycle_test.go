@@ -34,6 +34,10 @@ func TestLifecycleReconnectAndResubscribe(t *testing.T) {
 	lc := mqtt.NewLifecycle(mqtt.LifecycleConfig{
 		InitialBackoff: 5 * time.Second,
 		MaxBackoff:     30 * time.Second,
+		// Flap detection off: the proxy Severs the link seconds after it
+		// came up, which the default 10s FlapWindow would damp — this
+		// test asserts the immediate event-driven path.
+		FlapWindow: -1,
 	}, client)
 
 	// The ctx handed to Start governs the WHOLE reconnect loop, not just

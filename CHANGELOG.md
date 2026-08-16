@@ -3,6 +3,112 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.3.0] - 2026-08-16
+
+Audit release: a full-codebase adversarial review (four parallel
+reviewers over the wire codec, the connection core, the supporting
+components and the test/CI infrastructure, each finding substantiated
+by a failing test, a byte trace or a probe, plus read-only verification
+against a production mosquitto broker) produced 42 findings — 3 high,
+7 medium, 32 low. All are fixed or documented below. Exported API
+changes are purely additive.
+
+### Added
+
+- `LifecycleConfig.FlapWindow` (default 10s): a connection that drops
+  within this window of coming up counts as flapping and reconnects
+  with an exponentially growing delay instead of immediately.
+- `ConnectResult.ServerKeepAliveSet`: distinguishes a broker-sent
+  Server Keep Alive of 0 (keep-alive disabled, §3.1.2.10 — the client
+  now stops pinging entirely) from the property being absent.
+- Shared-subscription support in the codec: `protocol.MatchTopic`
+  matches a `$share/{ShareName}/{filter}` subscription against the
+  real delivery topic (prefix stripped per §4.8.2) — previously such a
+  subscription silently dropped every inbound message — and
+  `protocol.ValidateTopicFilter` enforces the §4.8.2 structural rules.
+
+### Fixed
+
+- **Teardown/Connect race poisoning a healthy session (high).**
+  `teardownLink` cleared the link pointer before failing the shared
+  waiters and send quota; a `Connect` landing in that window
+  established a healthy session whose quota the stale teardown then
+  marked failed — every QoS>0 publish returned `ErrConnectionLost`
+  forever while `IsConnected()` reported true, unrepairable by the
+  reconnect loop. Shared state is now poisoned before the pointer is
+  cleared.
+- **Undamped reconnect storm against a flapping broker (high).** The
+  event-driven reconnect path had no delay and reset the backoff on
+  every loss, redialling a broker that accepts CONNECTs and
+  immediately drops the socket at measured ~6000 dials/s. See
+  `FlapWindow` above.
+- **Circuit breaker tripped by client-side validation errors (high).**
+  `protocol.ErrProtocolViolation`/`ErrMalformedPacket`/
+  `ErrStringTooLong` raised before any bytes reach the wire (invalid
+  topic, QoS above the broker maximum, ...) counted as broker failures,
+  so one malformed topic opened the circuit for every healthy publish —
+  contrary to the documented contract. They are neutral now.
+- **Cross-session release in the read loop (medium).** The terminal-ack
+  paths released packet identifiers and quota permits unguarded; a read
+  loop stalled inside a store call across a reconnect could free an
+  identifier owned by the new session and credit its quota past the
+  negotiated Receive Maximum (§4.9). Both now release through the
+  generation-checked paths keyed to the link's session.
+- **Spurious reconnect after an intentional Disconnect (medium).** The
+  read/keep-alive loops ignored the graceful flag, so a broker closing
+  the socket in response to our own DISCONNECT signalled a connection
+  loss and made the Lifecycle reconnect a session the caller had just
+  shut down.
+- **Breaker outcomes booked against the wrong state (medium).** Every
+  state transition now bumps an epoch and outcomes from a superseded
+  epoch are discarded: a straggler publish can no longer free a
+  half-open probe slot it never held (admitting more than
+  `HalfOpenMax` concurrent probes) or close the circuit on stale
+  pre-trip evidence. `OnStateChange` callbacks are additionally
+  delivered in transition order.
+- **Backoff-collapsing jitter (medium).** `Jitter >= backoff` made a
+  large share of reconnect delays non-positive (an immediate-retry
+  spin); jittered delays are clamped to a floor of half the nominal
+  value, config defaulting handles negative values, and an inverted
+  `MaxBackoff < InitialBackoff` pair is raised.
+- **CONNACK sanity (low).** Session Present=1 answering CleanStart=1
+  refuses the session ([MQTT-3.2.2-4]); a phantom `ConnectResult` is no
+  longer published when the connect fails during session replay.
+- **QoS 2 recovery (low).** A PUBREC/PUBREL for an unknown packet
+  identifier is answered with reason 0x92 (Packet Identifier not
+  found) on v5 — previously warn-logged and left unanswered, stranding
+  the broker's QoS 2 flow in a retransmit loop.
+- **Watchdog and dispatch robustness (low).** The PINGRESP counter
+  increments before the PINGREQ write (restoring the documented
+  one-lost-PINGRESP tolerance); server-to-client-illegal packets
+  (second CONNACK, SUBSCRIBE, PINGREQ, ...) tear the connection down
+  per §4.13 instead of being read past; `Lifecycle.Start` drains a
+  stale ConnectionLost token buffered before its first connect.
+- **Stored-payload aliasing (low).** QoS>0 publishes deep-copy the
+  payload (and v5 correlation data) into the session store, so a caller
+  reusing its buffer can no longer corrupt the DUP replay after a
+  resumed session; the buffer-ownership rule is documented on
+  `Publish`.
+- **Codec spec conformance (low).** The wire codec now rejects: Topic
+  Alias 0, packet identifier 0 on every packet carrying one, DUP=1 on
+  QoS 0, non-minimal Variable Byte Integers ([MQTT-1.5.5-1]), more than
+  one Subscription Identifier on a SUBSCRIBE, out-of-range property
+  values (zero Receive Maximum/Maximum Packet Size, non-boolean flag
+  properties, Maximum QoS > 1), Session Present=1 with an error reason
+  code, out-of-range SUBACK/UNSUBACK reason codes (previously
+  surfaced as a nonsense "granted QoS 3" with a nil error), and
+  unsupported protocol versions in every encoder and decoder.
+  `ReadFrame` caps the total packet size (§2.1.4) instead of the
+  remaining length.
+- **Test/CI/infrastructure (low/medium).** ci.yml actions pinned by
+  commit SHA and lint tools by version; the release workflow's
+  CHANGELOG extraction matches the heading literally instead of via an
+  unescaped regex; expired e2e TLS certs are regenerated instead of
+  reused; the e2e Server Keep Alive scenario is reachable against the
+  harness's own mosquitto; stale documentation (breaker coverage,
+  reconnect semantics, a dead e2e env var, copyright headers) aligned
+  with reality.
+
 ## [1.2.0] - 2026-07-07
 
 Hardening release: a multi-agent adversarial audit across seven

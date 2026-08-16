@@ -16,10 +16,14 @@
 //	            localhost/127.0.0.1/::1 (0644)
 //	server.key  server private key, PKCS#8 PEM (0600)
 //
-// gencert is idempotent: if all three files already exist it does
-// nothing and exits 0, so `make e2e-certs` is safe to run repeatedly
-// (e.g. as an e2e-up dependency) without generating a fresh, mutually
-// distrusting CA/cert pair on every invocation.
+// gencert is idempotent: if all three files already exist AND the
+// server certificate still has more than certExpiryMargin of validity
+// left, it does nothing and exits 0, so `make e2e-certs` is safe to
+// run repeatedly (e.g. as an e2e-up dependency) without generating a
+// fresh, mutually distrusting CA/cert pair on every invocation. A
+// missing/unparsable/expired/soon-to-expire server certificate causes
+// the CA and server cert to be regenerated together as a pair (the
+// server cert is only valid against a CA generated in the same run).
 package main
 
 import (
@@ -48,6 +52,15 @@ const certValidity = 24 * time.Hour
 // doesn't make the cert look "not yet valid".
 const clockSkew = 5 * time.Minute
 
+// certExpiryMargin is the minimum remaining validity the idempotency
+// guard requires before it will reuse an existing server certificate.
+// Anything expired, or expiring within this margin, is treated as
+// stale and triggers regeneration — otherwise a cert generated just
+// before an e2e run could expire mid-run (or an operator re-running
+// `make e2e-certs` right at the edge of the 24h window would get a
+// cert that's already unusable by the time the brokers start).
+const certExpiryMargin = 1 * time.Hour
+
 func main() {
 	outDir := flag.String("out", "", "output directory for ca.pem, server.pem, server.key (required)")
 	flag.Parse()
@@ -69,8 +82,12 @@ func run(outDir string) error {
 	keyPath := filepath.Join(outDir, "server.key")
 
 	if filesExist(caPath, certPath, keyPath) {
-		slog.Info("e2e certs already present, skipping generation", "dir", outDir)
-		return nil
+		fresh, reason := serverCertFresh(certPath)
+		if fresh {
+			slog.Info("e2e certs already present and valid, skipping generation", "dir", outDir)
+			return nil
+		}
+		slog.Info("e2e certs present but stale, regenerating CA + server cert pair", "dir", outDir, "reason", reason)
 	}
 
 	if err := os.MkdirAll(outDir, 0o755); err != nil { //nolint:gosec // must stay traversable by whatever uid the docker bind-mount reads it as
@@ -115,6 +132,40 @@ func filesExist(paths ...string) bool {
 		}
 	}
 	return true
+}
+
+// serverCertFresh reports whether the server certificate PEM at
+// certPath parses and still has more than certExpiryMargin of
+// validity remaining. Any failure to read/decode/parse it, or a
+// NotAfter within certExpiryMargin (including already past),
+// is treated as "not fresh" — the caller regenerates the whole
+// CA/server-cert pair in that case. On a negative result, reason
+// explains why, for logging.
+func serverCertFresh(certPath string) (fresh bool, reason string) {
+	data, err := os.ReadFile(certPath) //nolint:gosec // path is this program's own fixed output location, not user input
+	if err != nil {
+		return false, fmt.Sprintf("read %s: %v", certPath, err)
+	}
+
+	block, _ := pem.Decode(data)
+	if block == nil {
+		return false, fmt.Sprintf("%s: no PEM block found", certPath)
+	}
+
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		return false, fmt.Sprintf("%s: parse certificate: %v", certPath, err)
+	}
+
+	deadline := cert.NotAfter.Add(-certExpiryMargin)
+	if time.Now().After(deadline) {
+		return false, fmt.Sprintf(
+			"%s: expires %s (within %s margin, or already expired)",
+			certPath, cert.NotAfter.Format(time.RFC3339), certExpiryMargin,
+		)
+	}
+
+	return true, ""
 }
 
 // generateCA creates a fresh, self-signed CA certificate and key.

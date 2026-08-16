@@ -126,6 +126,16 @@ type Publisher interface {
 	// fire-and-forget; QoS 1 blocks until PUBACK; QoS 2 blocks until
 	// PUBCOMP. The variadic options attach MQTT 5.0 PUBLISH properties
 	// (ignored on an MQTT 3.1.1 link).
+	//
+	// Buffer ownership: payload (and any byte slice passed through an
+	// option, such as [WithCorrelationData]) belongs to the caller and may
+	// be reused or mutated as soon as Publish returns. An implementation
+	// that must retain the message beyond the call — a QoS>0 client
+	// keeping it for the DUP resend a resumed session replays — copies it.
+	// Implementations MUST NOT alias the caller's buffer for that purpose:
+	// a caller publishing out of a reused scratch buffer would otherwise
+	// corrupt the replayed message's bytes under its original packet
+	// identifier, a wrong-payload delivery no acknowledgement can catch.
 	Publish(ctx context.Context, topic string, payload []byte, qos QoS, retain bool, opts ...PublishOption) error
 }
 

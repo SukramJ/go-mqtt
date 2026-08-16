@@ -48,7 +48,10 @@ func varintBytes(v uint32) []byte {
 func connackV5Body(tb testing.TB) []byte {
 	tb.Helper()
 	var buf bytes.Buffer
-	buf.WriteByte(0x01) // session present
+	// Session Present stays 0: pairing it with a failure reason code is a
+	// [MQTT-3.2.2-4] violation the decoder rejects, which would make this a
+	// seed that never reaches the property block.
+	buf.WriteByte(0x00)
 	buf.WriteByte(byte(BadUserNameOrPassword))
 	if err := mergedProps(tgConnack).encode(&buf, tgConnack); err != nil {
 		tb.Fatalf("connackV5Body: %v", err)
@@ -377,10 +380,13 @@ func FuzzPropertiesRoundTrip(f *testing.F) {
 }
 
 // FuzzTopicMatch drives MatchTopic with arbitrary filter/topic pairs.
-// Invariants: it never panics; a spec-valid, wildcard-free topic always
-// matches itself; and a topic whose first level begins with '$' never
-// matches a filter whose first byte is a wildcard character, mirroring
-// MatchTopic's own MQTT-4.7.2-1 guard so a regression there is caught here.
+// Invariants: it never panics; a spec-valid, wildcard-free topic that is not
+// itself a shared-subscription filter always matches itself; wrapping a
+// filter in a well-formed "$share/{ShareName}/" prefix never changes what it
+// matches (MQTT 5.0 §4.8.2); and a topic whose first level begins with '$'
+// never matches a filter whose (post-strip) first byte is a wildcard
+// character, mirroring MatchTopic's own MQTT-4.7.2-1 guard so a regression
+// there is caught here.
 func FuzzTopicMatch(f *testing.F) {
 	f.Add("a/b", "a/b")
 	f.Add("a/+", "a/b")
@@ -392,17 +398,55 @@ func FuzzTopicMatch(f *testing.F) {
 	f.Add("sport/+/player1", "sport/tennis/player1")
 	f.Add("", "")
 	f.Add("/", "/")
+	// Shared subscriptions (§4.8.2): well-formed shapes, the wildcard and
+	// '$'-protection interactions, and every degenerate prefix that must be
+	// treated as an ordinary literal filter instead.
+	f.Add("$share/grp/sensors/temp", "sensors/temp")
+	f.Add("$share/grp/sensors/+", "sensors/temp")
+	f.Add("$share/grp/#", "sensors/temp/raw")
+	f.Add("$share/g/#", "$SYS/broker")
+	f.Add("$share/g/+/x", "$SYS/x")
+	f.Add("$share/g/$SYS/#", "$SYS/broker/load")
+	f.Add("$share/grp/sensors/temp", "$share/grp/sensors/temp")
+	f.Add("$share", "$share")
+	f.Add("$share/", "$share/")
+	f.Add("$share/name", "$share/name")
+	f.Add("$share/name/", "$share/name/")
+	f.Add("$share//f", "f")
+	f.Add("$share/+/f", "$share/x/f")
+	f.Add("$share/#/f", "f")
+	f.Add("$SHARE/g/f", "f")
 
 	f.Fuzz(func(t *testing.T, filter, topic string) {
 		result := MatchTopic(filter, topic)
 
-		if err := ValidateTopicName(topic); err == nil {
-			if !MatchTopic(topic, topic) {
-				t.Fatalf("MatchTopic(%q, %q) = false, want true (reflexive, wildcard-free)", topic, topic)
+		// A shared-subscription filter deliberately does not match its own
+		// literal spelling: the broker publishes the real topic, so only the
+		// wrapped filter takes part in matching.
+		if _, _, shared := splitShared(topic); !shared {
+			if err := ValidateTopicName(topic); err == nil {
+				if !MatchTopic(topic, topic) {
+					t.Fatalf("MatchTopic(%q, %q) = false, want true (reflexive, wildcard-free)", topic, topic)
+				}
 			}
 		}
 
-		if topic != "" && topic[0] == '$' && filter != "" && (filter[0] == '#' || filter[0] == '+') {
+		effective := filter
+		if _, wrapped, ok := splitShared(filter); ok {
+			effective = wrapped
+		}
+
+		// Wrapping an already-shared filter would nest two "$share/" levels,
+		// and only the outermost is structural — so the equivalence only
+		// holds for a filter that is not itself a shared subscription.
+		if filter != "" && effective == filter {
+			if got := MatchTopic(sharedPrefix+"grp/"+filter, topic); got != result {
+				t.Fatalf("MatchTopic(%q, %q) = %v, want %v ($share wrapping must not change matching)",
+					sharedPrefix+"grp/"+filter, topic, got, result)
+			}
+		}
+
+		if topic != "" && topic[0] == '$' && effective != "" && (effective[0] == '#' || effective[0] == '+') {
 			if result {
 				t.Fatalf("MatchTopic(%q, %q) = true, want false ($ first level vs wildcard-first filter)", filter, topic)
 			}

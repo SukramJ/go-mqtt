@@ -194,20 +194,37 @@ func TestReadFrameRejectsOversizedBeforeAlloc(t *testing.T) {
 	}
 }
 
+// TestReadFrameAtLimit pins §2.1.4 total-packet-size accounting: the cap
+// covers the fixed-header byte and the remaining-length varint as well as
+// the body, so an 8-byte body is exactly a 10-byte packet.
 func TestReadFrameAtLimit(t *testing.T) {
 	t.Parallel()
-	const limit = 8
-	body := []byte("12345678") // exactly the limit
+	body := []byte("12345678")
+	const total = 1 + 1 + 8 // fixed header + 1-byte remaining length + body
+
 	var buf bytes.Buffer
 	if err := writePacket(&buf, byte(Publish)<<4, body); err != nil {
 		t.Fatalf("writePacket: %v", err)
 	}
-	f, err := ReadFrame(&buf, limit)
+	if buf.Len() != total {
+		t.Fatalf("encoded packet is %d bytes, want %d", buf.Len(), total)
+	}
+	f, err := ReadFrame(&buf, total)
 	if err != nil {
 		t.Fatalf("ReadFrame at limit: %v", err)
 	}
 	if !bytes.Equal(f.Body, body) {
 		t.Fatalf("body = %q", f.Body)
+	}
+
+	// One byte under the total packet size is rejected, even though the
+	// remaining length alone would still fit.
+	buf.Reset()
+	if err := writePacket(&buf, byte(Publish)<<4, body); err != nil {
+		t.Fatalf("writePacket: %v", err)
+	}
+	if _, err := ReadFrame(&buf, total-1); !errors.Is(err, ErrFrameTooLarge) {
+		t.Fatalf("ReadFrame one byte over: got %v, want ErrFrameTooLarge", err)
 	}
 }
 

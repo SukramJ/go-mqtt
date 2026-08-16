@@ -4,6 +4,7 @@
 package mqtt
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -23,6 +24,10 @@ var errAckTimeout = errors.New("mqtt/tcp: timed out waiting for acknowledgement"
 // [ErrConnectionLost]; a broker failure reason code yields a *[ReasonError].
 // Each acknowledgement wait is bounded by ctx and the configured
 // AckTimeout.
+//
+// payload (and any option-supplied byte slice) may be reused once Publish
+// returns: a QoS>0 message the client must keep for session replay is
+// stored as a private copy. See [Publisher.Publish].
 func (c *TCPClient) Publish(ctx context.Context, topic string, payload []byte, qos QoS, retain bool, opts ...PublishOption) error {
 	if err := protocol.ValidateTopicName(topic); err != nil {
 		return err
@@ -115,8 +120,7 @@ func (c *TCPClient) publishAcked(ctx context.Context, l *link, pkt *protocol.Pub
 	}
 	pkt.PacketID = id
 
-	stored := *pkt
-	if err := c.store.Save(StoredMessage{ID: id, Kind: StoredPublish, Publish: &stored}); err != nil {
+	if err := c.store.Save(StoredMessage{ID: id, Kind: StoredPublish, Publish: storedCopy(pkt)}); err != nil {
 		c.ids.ReleaseAt(id, idGen)
 		c.quota.releaseAt(quotaGen)
 		return err
@@ -125,20 +129,52 @@ func (c *TCPClient) publishAcked(ctx context.Context, l *link, pkt *protocol.Pub
 	ch := c.registerWaiter(id, ackClassPublish)
 	if err := c.writeFrame(l, pkt.Encode); err != nil {
 		c.removeWaiter(id, ch)
+		// The stored entry, the identifier and the send-quota permit are one
+		// unit: either this failed send owns all three and tears them all
+		// down, or a reconnect has already adopted the unit and this
+		// goroutine must touch none of it. The quota generation is what
+		// distinguishes the two — applySession bumps it (quota.reset) as the
+		// last step of re-accounting the session — so it is read once and
+		// gates the whole block, rather than each release deciding for
+		// itself. In particular the identifier must NOT be freed while the
+		// entry survives for replay: the allocator would hand it to a fresh
+		// publish while the DUP resend is still using it on the wire.
+		//
+		// The stamps are the ones this send acquired under, not the link's
+		// (l.quotaGen / l.idGen). They normally agree; where they can differ
+		// — quota.acquire parked on an exhausted quota and was woken by the
+		// reconnect's quota.reset, so the permit belongs to the NEW session
+		// while l is the old link — the acquire-time generation is the
+		// correct one: booking against l's would skip the release and leak
+		// that permit for the new session's lifetime.
 		if c.quota.generation() == quotaGen {
 			// The frame never (completely) reached the broker and no
 			// reconnect has re-accounted the session since: drop the stored
 			// state, free the identifier and release the permit — there is
 			// nothing in flight and nothing to replay.
+			//
+			// Residual race, deliberately accepted: applySession can land
+			// between this generation read and the Delete below, having
+			// already counted the entry as in-flight (inflightPermits runs
+			// before quota.reset). The new session then starts one permit
+			// short, and — on a resumed session — replaySession may find the
+			// entry gone. Closing that window needs the decision and the
+			// delete to be one atomic step, which the exported SessionStore
+			// contract cannot express (there is no conditional/compare-and-
+			// delete), and widening the store interface for a few
+			// instructions of exposure is not worth an API break. The
+			// failure mode is bounded and benign: at most one lost permit
+			// per occurrence, never an over-credit past Receive Maximum.
 			_ = c.store.Delete(id, StoredPublish)
 			c.ids.ReleaseAt(id, idGen)
 			c.quota.releaseAt(quotaGen)
 		}
 		// Otherwise a teardown + reconnect completed while this goroutine
 		// was parked in the failing write: applySession has re-accounted the
-		// stored entry (a resumed session counts and replays it; a reset
-		// session discarded it), so every piece of cleanup here would clobber
-		// state the new session owns.
+		// stored entry (a resumed session counts and replays it as a DUP —
+		// permitted by at-least-once semantics even though this caller sees
+		// an error; a reset session discarded it), so every piece of cleanup
+		// here would clobber state the new session owns.
 		return err
 	}
 
@@ -165,6 +201,31 @@ func (c *TCPClient) publishAcked(ctx context.Context, l *link, pkt *protocol.Pub
 		return &ReasonError{Packet: "PUBLISH", Code: res.code, Reason: res.reason}
 	}
 	return nil
+}
+
+// storedCopy is the replay copy of an outbound QoS>0 PUBLISH: a shallow
+// copy of the packet with every caller-owned byte slice cloned.
+//
+// A shallow copy alone keeps the caller's buffers alive inside the session
+// store. [Publisher.Publish] documents the payload as reusable once the
+// call returns, and a caller that does reuse a scratch buffer would then
+// silently rewrite the bytes a DUP resend puts on the wire after a
+// reconnect — the wrong payload delivered under the original packet
+// identifier, which no acknowledgement can detect. The clones are Payload
+// and the MQTT 5.0 Correlation Data property, the only caller-provided
+// slices reachable from an encoded PUBLISH: the remaining property fields
+// are strings (immutable) or slices this package itself allocated —
+// WithUserProperties appends into a fresh slice, and the *uint32/*byte
+// property values point at option-closure copies.
+func storedCopy(pkt *protocol.PublishPacket) *protocol.PublishPacket {
+	stored := *pkt
+	stored.Payload = bytes.Clone(pkt.Payload)
+	if pkt.Properties != nil {
+		props := *pkt.Properties
+		props.CorrelationData = bytes.Clone(pkt.Properties.CorrelationData)
+		stored.Properties = &props
+	}
+	return &stored
 }
 
 // Subscribe implements [Subscriber]. It sends a single-filter SUBSCRIBE and

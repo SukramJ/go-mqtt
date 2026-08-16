@@ -141,8 +141,12 @@ type ConnackPacket struct {
 // For [V311] the body is exactly two bytes and the return code is mapped
 // to its v5-equivalent reason code (unknown non-zero codes become
 // [UnspecifiedError]). For [V50] the reason code is followed by a CONNACK
-// property block. Any truncation, reserved-flag violation or trailing byte
-// yields an error wrapping [ErrMalformedPacket]; decoding never panics.
+// property block. Session Present may only be set alongside a success
+// reason code ([MQTT-3.2.2-4] / 3.1.1 §3.2.2.2: a server refusing the
+// connection MUST set Session Present to 0), so the combination is
+// rejected on both versions. Any truncation, reserved-flag violation,
+// out-of-range property value or trailing byte yields an error wrapping
+// [ErrMalformedPacket]; decoding never panics.
 func DecodeConnack(v Version, body []byte) (*ConnackPacket, error) {
 	c := newCursor(body)
 
@@ -158,6 +162,14 @@ func DecodeConnack(v Version, body []byte) (*ConnackPacket, error) {
 	rc, err := c.readByte()
 	if err != nil {
 		return nil, err
+	}
+	// [MQTT-3.2.2-4] (v5) / §3.2.2.2 (v3.1.1): a refused connection carries
+	// Session Present = 0. The pair "session present + refusal" is
+	// contradictory — the client would resume a session on a connection the
+	// server never accepted — so refuse the packet outright rather than
+	// letting the adapter pick one half to believe.
+	if p.SessionPresent && rc != 0 {
+		return nil, wrapMalformed("CONNACK with Session Present and a non-zero reason code")
 	}
 
 	switch v {

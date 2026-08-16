@@ -98,6 +98,30 @@ const userPropTargets = tgConnect | tgConnack | tgPublish | willBit |
 // encode and decode consult it: encode rejects a populated-but-illegal
 // property with [ErrProtocolViolation]; decode rejects an
 // unknown-or-illegal identifier with [ErrMalformedPacket].
+//
+// Known limitation — the table is direction-blind: it records only which
+// packet type may carry a property, not which peer may send it. A handful
+// of properties are legal on a packet type in one direction only, and this
+// codec does not model that dimension:
+//
+//   - Subscription Identifier (0x0B) on PUBLISH is server-to-client only
+//     [MQTT-3.3.4-6]; a client encoding one onto an outbound PUBLISH is a
+//     Protocol Error this table does not catch (the golden test
+//     TestEncodePublishV5PropsGolden deliberately exercises exactly that
+//     encode, pinning today's permissive behavior).
+//   - Assigned Client Identifier (0x12), Server Keep Alive (0x13),
+//     Response Information (0x1A), Maximum QoS (0x24), Retain Available
+//     (0x25) and the *Available flags (0x28/0x29/0x2A) are CONNACK-only,
+//     hence implicitly server-to-client — but only because this client
+//     never decodes a CONNECT, not because the table says so.
+//
+// Adding a direction dimension was considered and deliberately deferred:
+// it would widen every propTarget to a (packet, direction) pair for a rule
+// that only bites a caller hand-crafting packets this client does not
+// send. Both directions of the codec stay symmetric instead — what encode
+// accepts, decode accepts — so a peer's frames are never rejected on a
+// rule this package cannot also honor on encode. Revisit if this package
+// ever grows a server side.
 var propertySpec = map[byte]propTarget{
 	0x01: tgPublish | willBit,                                                                                    // Payload Format Indicator
 	0x02: tgPublish | willBit,                                                                                    // Message Expiry Interval
@@ -137,6 +161,52 @@ func checkEncodeAllowed(id byte, target propTarget) error {
 	return nil
 }
 
+// propertyValueViolation is the single source of truth for the property
+// VALUE ranges MQTT 5.0 declares a Protocol Error, mirroring what
+// [propertySpec] is for property placement. It returns a description of
+// why v is illegal for property id, or "" when v is in range. Both
+// directions consult it, so this codec never emits a value it would refuse
+// to accept:
+//
+//   - 0x01 Payload Format Indicator, §3.3.2.3.2 — 0 or 1.
+//   - 0x17 Request Problem Information, §3.1.2.11.7 — 0 or 1.
+//   - 0x19 Request Response Information, §3.1.2.11.6 — 0 or 1.
+//   - 0x21 Receive Maximum, §3.1.2.11.3 / §3.2.2.3.3 — never 0.
+//   - 0x23 Topic Alias, §3.3.2.3.4 — never 0.
+//   - 0x24 Maximum QoS, §3.2.2.3.4 — 0 or 1 (a server that supports QoS 2
+//     omits the property rather than sending 2).
+//   - 0x25 Retain Available §3.2.2.3.5, 0x28 Wildcard Subscription
+//     Available §3.2.2.3.11, 0x29 Subscription Identifier Available
+//     §3.2.2.3.12, 0x2A Shared Subscription Available §3.2.2.3.13 — 0 or 1.
+//   - 0x27 Maximum Packet Size, §3.1.2.11.4 / §3.2.2.3.6 — never 0.
+//
+// Subscription Identifier (0x0B) is likewise 0-forbidden but is validated
+// where it is read/written, since it is a varint with its own upper bound.
+func propertyValueViolation(id byte, v uint32) string {
+	switch id {
+	case 0x01, 0x17, 0x19, 0x24, 0x25, 0x28, 0x29, 0x2A:
+		if v > 1 {
+			return "value must be 0 or 1"
+		}
+	case 0x21, 0x23, 0x27:
+		if v == 0 {
+			return "value must not be 0"
+		}
+	}
+	return ""
+}
+
+// checkEncodeValue reports whether value is in range for property id per
+// [propertyValueViolation], returning [ErrProtocolViolation] if not — the
+// encode-side counterpart of the [ErrMalformedPacket] the property
+// decoders return for the very same rule.
+func checkEncodeValue(id byte, value uint32) error {
+	if why := propertyValueViolation(id, value); why != "" {
+		return fmt.Errorf("%w: property 0x%02X %s", ErrProtocolViolation, id, why)
+	}
+	return nil
+}
+
 // encode writes p as an MQTT 5.0 property block (a variable-byte-integer
 // length prefix followed by the property bytes) to buf. Properties are
 // emitted in ascending identifier order so the output is deterministic.
@@ -160,6 +230,9 @@ func (p *Properties) encode(buf *bytes.Buffer, target propTarget) error {
 		if err := checkEncodeAllowed(id, target); err != nil {
 			return err
 		}
+		if err := checkEncodeValue(id, uint32(*v)); err != nil {
+			return err
+		}
 		body.WriteByte(id)
 		body.WriteByte(*v)
 		return nil
@@ -169,6 +242,9 @@ func (p *Properties) encode(buf *bytes.Buffer, target propTarget) error {
 			return nil
 		}
 		if err := checkEncodeAllowed(id, target); err != nil {
+			return err
+		}
+		if err := checkEncodeValue(id, uint32(*v)); err != nil {
 			return err
 		}
 		body.WriteByte(id)
@@ -182,6 +258,9 @@ func (p *Properties) encode(buf *bytes.Buffer, target propTarget) error {
 			return nil
 		}
 		if err := checkEncodeAllowed(id, target); err != nil {
+			return err
+		}
+		if err := checkEncodeValue(id, *v); err != nil {
 			return err
 		}
 		body.WriteByte(id)
@@ -229,6 +308,14 @@ func (p *Properties) encode(buf *bytes.Buffer, target propTarget) error {
 	if len(p.SubscriptionIdentifiers) > 0 {
 		if err := checkEncodeAllowed(0x0B, target); err != nil {
 			return err
+		}
+		// §3.8.2.1.2: a SUBSCRIBE carries at most one Subscription
+		// Identifier — more than one is a Protocol Error. A PUBLISH may
+		// legitimately carry several (§3.3.4: one per matching
+		// subscription), which is why the field is a slice at all.
+		if target&tgSubscribe != 0 && len(p.SubscriptionIdentifiers) > 1 {
+			return fmt.Errorf("%w: SUBSCRIBE with %d subscription identifiers",
+				ErrProtocolViolation, len(p.SubscriptionIdentifiers))
 		}
 		for _, id := range p.SubscriptionIdentifiers {
 			if id == 0 || id > maxVarint {
@@ -327,9 +414,11 @@ func (p *Properties) encode(buf *bytes.Buffer, target propTarget) error {
 // the advertised length. It rejects a length that overruns the remaining
 // packet, an unknown identifier, an identifier illegal for target, a
 // duplicate of any non-repeatable property (every property except User
-// Property 0x26 and Subscription Identifier 0x0B), and any truncated
-// value — always with an error wrapping [ErrMalformedPacket], never a
-// panic. A zero-length block yields a nil *Properties.
+// Property 0x26, plus Subscription Identifier 0x0B on a PUBLISH — see
+// [repeatableProperty]), a value outside the range the spec allows (see
+// [propertyValueViolation]), and any truncated value — always with an
+// error wrapping [ErrMalformedPacket], never a panic. A zero-length block
+// yields a nil *Properties.
 func decodeProperties(c *cursor, target propTarget) (*Properties, error) {
 	length, err := c.readVarint()
 	if err != nil {
@@ -359,7 +448,7 @@ func decodeProperties(c *cursor, target propTarget) (*Properties, error) {
 		if allowed&target == 0 {
 			return nil, fmt.Errorf("%w: property 0x%02X illegal in this packet", ErrMalformedPacket, id)
 		}
-		if id != 0x26 && id != 0x0B {
+		if !repeatableProperty(id, target) {
 			bit := uint64(1) << id
 			if seen&bit != 0 {
 				return nil, fmt.Errorf("%w: duplicate property 0x%02X", ErrMalformedPacket, id)
@@ -373,21 +462,79 @@ func decodeProperties(c *cursor, target propTarget) (*Properties, error) {
 	return p, nil
 }
 
+// repeatableProperty reports whether property id may appear more than once
+// in a property block for target. User Property (0x26) always may. A
+// Subscription Identifier (0x0B) may repeat on a PUBLISH — one per matching
+// subscription (§3.3.4) — but a SUBSCRIBE carrying more than one is a
+// Protocol Error (§3.8.2.1.2), so there it is treated like any other
+// single-shot property and a second occurrence is rejected as a duplicate.
+// Mirrors the encode-side check in [Properties.encode].
+func repeatableProperty(id byte, target propTarget) bool {
+	switch id {
+	case 0x26:
+		return true
+	case 0x0B:
+		return target&tgPublish != 0
+	default:
+		return false
+	}
+}
+
+// readPropByte, readPropUint16 and readPropUint32 read a numeric property
+// value through the bounds-checked cursor and validate it against the
+// shared [propertyValueViolation] table, so a spec-illegal value (Receive
+// Maximum 0, Topic Alias 0, a boolean property outside {0,1}, ...) is
+// rejected as a Malformed Packet at exactly the same point in the codec
+// that refuses to encode it.
+func readPropByte(c *cursor, id byte) (byte, error) {
+	v, err := c.readByte()
+	if err != nil {
+		return 0, err
+	}
+	if why := propertyValueViolation(id, uint32(v)); why != "" {
+		return 0, fmt.Errorf("%w: property 0x%02X %s", ErrMalformedPacket, id, why)
+	}
+	return v, nil
+}
+
+func readPropUint16(c *cursor, id byte) (uint16, error) {
+	v, err := c.readUint16()
+	if err != nil {
+		return 0, err
+	}
+	if why := propertyValueViolation(id, uint32(v)); why != "" {
+		return 0, fmt.Errorf("%w: property 0x%02X %s", ErrMalformedPacket, id, why)
+	}
+	return v, nil
+}
+
+func readPropUint32(c *cursor, id byte) (uint32, error) {
+	v, err := c.readUint32()
+	if err != nil {
+		return 0, err
+	}
+	if why := propertyValueViolation(id, v); why != "" {
+		return 0, fmt.Errorf("%w: property 0x%02X %s", ErrMalformedPacket, id, why)
+	}
+	return v, nil
+}
+
 // decodeOne reads the single value for property id from c and stores it on
 // p. id has already been validated as known and legal by
 // [decodeProperties]. Every read goes through the bounds-checked cursor,
 // so a truncated value surfaces as [ErrMalformedPacket] rather than a
-// panic.
+// panic; numeric values additionally go through the readProp* helpers,
+// which enforce the spec's value ranges.
 func (p *Properties) decodeOne(c *cursor, id byte) error {
 	switch id {
 	case 0x01:
-		v, err := c.readByte()
+		v, err := readPropByte(c, id)
 		if err != nil {
 			return err
 		}
 		p.PayloadFormat = &v
 	case 0x02:
-		v, err := c.readUint32()
+		v, err := readPropUint32(c, id)
 		if err != nil {
 			return err
 		}
@@ -420,7 +567,7 @@ func (p *Properties) decodeOne(c *cursor, id byte) error {
 		}
 		p.SubscriptionIdentifiers = append(p.SubscriptionIdentifiers, v)
 	case 0x11:
-		v, err := c.readUint32()
+		v, err := readPropUint32(c, id)
 		if err != nil {
 			return err
 		}
@@ -432,7 +579,7 @@ func (p *Properties) decodeOne(c *cursor, id byte) error {
 		}
 		p.AssignedClientID = s
 	case 0x13:
-		v, err := c.readUint16()
+		v, err := readPropUint16(c, id)
 		if err != nil {
 			return err
 		}
@@ -450,19 +597,19 @@ func (p *Properties) decodeOne(c *cursor, id byte) error {
 		}
 		p.AuthData = b
 	case 0x17:
-		v, err := c.readByte()
+		v, err := readPropByte(c, id)
 		if err != nil {
 			return err
 		}
 		p.RequestProblemInfo = &v
 	case 0x18:
-		v, err := c.readUint32()
+		v, err := readPropUint32(c, id)
 		if err != nil {
 			return err
 		}
 		p.WillDelayInterval = &v
 	case 0x19:
-		v, err := c.readByte()
+		v, err := readPropByte(c, id)
 		if err != nil {
 			return err
 		}
@@ -486,31 +633,31 @@ func (p *Properties) decodeOne(c *cursor, id byte) error {
 		}
 		p.ReasonString = s
 	case 0x21:
-		v, err := c.readUint16()
+		v, err := readPropUint16(c, id)
 		if err != nil {
 			return err
 		}
 		p.ReceiveMaximum = &v
 	case 0x22:
-		v, err := c.readUint16()
+		v, err := readPropUint16(c, id)
 		if err != nil {
 			return err
 		}
 		p.TopicAliasMaximum = &v
 	case 0x23:
-		v, err := c.readUint16()
+		v, err := readPropUint16(c, id)
 		if err != nil {
 			return err
 		}
 		p.TopicAlias = &v
 	case 0x24:
-		v, err := c.readByte()
+		v, err := readPropByte(c, id)
 		if err != nil {
 			return err
 		}
 		p.MaximumQoS = &v
 	case 0x25:
-		v, err := c.readByte()
+		v, err := readPropByte(c, id)
 		if err != nil {
 			return err
 		}
@@ -526,25 +673,25 @@ func (p *Properties) decodeOne(c *cursor, id byte) error {
 		}
 		p.UserProperties = append(p.UserProperties, UserProperty{Key: k, Value: val})
 	case 0x27:
-		v, err := c.readUint32()
+		v, err := readPropUint32(c, id)
 		if err != nil {
 			return err
 		}
 		p.MaximumPacketSize = &v
 	case 0x28:
-		v, err := c.readByte()
+		v, err := readPropByte(c, id)
 		if err != nil {
 			return err
 		}
 		p.WildcardSubAvailable = &v
 	case 0x29:
-		v, err := c.readByte()
+		v, err := readPropByte(c, id)
 		if err != nil {
 			return err
 		}
 		p.SubIDAvailable = &v
 	case 0x2A:
-		v, err := c.readByte()
+		v, err := readPropByte(c, id)
 		if err != nil {
 			return err
 		}

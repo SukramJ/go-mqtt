@@ -32,7 +32,12 @@ func (c *TCPClient) readLoop(l *link) {
 			if !isStopping(l) {
 				c.logger.Warn("mqtt.tcp.read", slog.String("err", err.Error()))
 			}
-			c.teardownLink(l, false)
+			// A caller Disconnect is a completely normal way to reach this
+			// branch: the broker closes the socket the moment it reads our
+			// DISCONNECT, so the read error races Disconnect's own teardown.
+			// Honour l.graceful or that race raises a lost-connection signal
+			// for an intentional shutdown and a [Lifecycle] reconnects.
+			c.teardownLink(l, l.graceful.Load())
 			return
 		}
 		if isStopping(l) {
@@ -41,10 +46,13 @@ func (c *TCPClient) readLoop(l *link) {
 			// reconnect may already have swapped in a new link that shares
 			// c.ids, c.quota and c.store. A bufio.Reader can still surface a
 			// pipelined PUBACK/PUBCOMP from the now-dead socket here; handling
-			// it would run completeOutbound/handlePubrec against the NEW link's
-			// allocator and quota (double-freeing a reused packet id,
-			// over-crediting the send quota past Receive Maximum). Drop it and
-			// exit — teardownLink has already run for this link.
+			// it would run completeOutbound/handlePubrec against the NEW
+			// session's store and waiter table, dropping a stored PUBLISH the
+			// new session owns and resolving its waiter with a stale
+			// acknowledgement. (The identifier and quota releases are
+			// generation-checked against this link, so those two survive the
+			// race on their own — this check is what protects the rest.) Drop
+			// the frame and exit — teardownLink has already run for this link.
 			return
 		}
 		if err := frame.ValidateFlags(); err != nil {
@@ -89,8 +97,17 @@ func (c *TCPClient) handleFrame(l *link, frame protocol.Frame) bool {
 		return false
 	default:
 		// CONNECT/CONNACK/SUBSCRIBE/UNSUBSCRIBE/PINGREQ are client→server
-		// only; receiving one means the peer is confused.
+		// only, and a CONNACK is additionally forbidden after the first one
+		// ([MQTT-3.2.0-1]). Receiving any of them is a §4.13 Protocol Error,
+		// not a frame to log and read past: the peer's state machine is
+		// desynchronised from ours, so every subsequent frame it sends is
+		// suspect. Tear the connection down with 0x82 like every other
+		// protocol violation in this file. (Reserved/unknown packet types
+		// never reach here — ValidateFlags rejects them as Malformed Packet
+		// in readLoop, which closes the connection with 0x81.)
 		c.logger.Warn("mqtt.tcp.unexpected_packet", slog.String("type", frame.PacketType().String()))
+		c.protocolError(l, protocol.ProtocolErrorReason)
+		return false
 	}
 	return true
 }
@@ -194,16 +211,29 @@ func (c *TCPClient) handleInboundQoS2(l *link, pub *protocol.PublishPacket) bool
 }
 
 // handleInboundPubrel completes the receiver-side QoS 2 handshake: PUBCOMP
-// the identifier and drop its dedup record. An unknown identifier is still
-// PUBCOMP'd (the peer must be released either way). A PUBREL that cannot be
-// decoded is a Malformed Packet and fatal (§4.13.1) — reading on would
-// leave the peer's QoS 2 flow and our dedup entry stuck forever.
+// the identifier and drop its dedup record. A PUBREL that cannot be decoded
+// is a Malformed Packet and fatal (§4.13.1) — reading on would leave the
+// peer's QoS 2 flow and our dedup entry stuck forever.
+//
+// An identifier with no dedup record — the broker retrying a PUBREL whose
+// PUBCOMP was lost, or a session this side discarded — is still answered,
+// because leaving it unanswered strands the peer's exchange. But it is
+// answered with 0x92 Packet Identifier not found (§3.6.2.1), not Success:
+// Success asserts the message was delivered exactly once by this client,
+// which is precisely what it cannot claim for state it does not have. On an
+// MQTT 3.1.1 link the PUBCOMP carries no reason code at all, so the same
+// call emits the plain acknowledgement.
 func (c *TCPClient) handleInboundPubrel(l *link, frame protocol.Frame) bool {
 	ack, err := protocol.DecodeAck(c.version, protocol.Pubrel, frame.Body)
 	if err != nil {
 		c.logger.Warn("mqtt.tcp.malformed_pubrel", slog.String("err", err.Error()))
 		c.protocolError(l, protocol.MalformedPacketReason)
 		return false
+	}
+	if !c.storeContains(ack.PacketID, StoredInboundID) {
+		c.logger.Warn("mqtt.tcp.pubrel_unknown_id", slog.Uint64("packet_id", uint64(ack.PacketID)))
+		c.sendAckReason(l, protocol.Pubcomp, ack.PacketID, protocol.PacketIdentifierNotFound)
+		return true
 	}
 	_ = c.store.Delete(ack.PacketID, StoredInboundID)
 	c.sendAck(l, protocol.Pubcomp, ack.PacketID)
@@ -229,9 +259,9 @@ func (c *TCPClient) handleAck(l *link, frame protocol.Frame, t protocol.PacketTy
 	reason := reasonStringOf(ack.Properties)
 	switch t {
 	case protocol.Puback:
-		c.completeOutbound(ack.PacketID, StoredPublish, ackResult{code: ack.ReasonCode, reason: reason})
+		c.completeOutbound(l, ack.PacketID, StoredPublish, ackResult{code: ack.ReasonCode, reason: reason})
 	case protocol.Pubcomp:
-		c.completeOutbound(ack.PacketID, StoredPubrel, ackResult{code: ack.ReasonCode, reason: reason})
+		c.completeOutbound(l, ack.PacketID, StoredPubrel, ackResult{code: ack.ReasonCode, reason: reason})
 	case protocol.Pubrec:
 		c.handlePubrec(l, ack, reason)
 	default:
@@ -248,15 +278,22 @@ func (c *TCPClient) handleAck(l *link, frame protocol.Frame, t protocol.PacketTy
 // here is the one the original publishAcked goroutine intentionally left
 // held when the send outlived its caller (ctx cancel / ack timeout / a
 // connection drop that resumed the session).
-func (c *TCPClient) completeOutbound(id uint16, kind StoredKind, res ackResult) {
+//
+// The identifier and permit are freed against the generations l was
+// established under: a store call can block (a persistent [SessionStore] is
+// an explicitly supported extension point) long enough for this read loop to
+// outlive its own link, and an unguarded release would then free an
+// identifier the reconnected session already handed to another exchange and
+// credit that session's quota past the negotiated Receive Maximum.
+func (c *TCPClient) completeOutbound(l *link, id uint16, kind StoredKind, res ackResult) {
 	if !c.storeContains(id, kind) {
 		c.logger.Warn("mqtt.tcp.ack_unknown_id",
 			slog.Uint64("packet_id", uint64(id)), slog.String("kind", kind.String()))
 		return
 	}
 	_ = c.store.Delete(id, kind)
-	c.ids.Release(id)
-	c.quota.release()
+	c.ids.ReleaseAt(id, l.idGen)
+	c.quota.releaseAt(l.quotaGen)
 	if !c.signalWaiter(id, ackClassPublish, res) {
 		c.logger.Debug("mqtt.tcp.ack_replayed", slog.Uint64("packet_id", uint64(id)))
 	}
@@ -272,10 +309,13 @@ func (c *TCPClient) handlePubrec(l *link, ack *protocol.AckPacket, reason string
 	if c.storeContains(id, StoredPublish) {
 		if ack.ReasonCode.IsError() {
 			// Terminal abort of the exchange: drop the stored PUBLISH, free
-			// the id and release the send-quota permit it held.
+			// the id and release the send-quota permit it held — both against
+			// l's session generations, so a read loop that stalled in the
+			// store across a reconnect cannot corrupt the new session's
+			// accounting (see completeOutbound).
 			_ = c.store.Delete(id, StoredPublish)
-			c.ids.Release(id)
-			c.quota.release()
+			c.ids.ReleaseAt(id, l.idGen)
+			c.quota.releaseAt(l.quotaGen)
 			if !c.signalWaiter(id, ackClassPublish, ackResult{code: ack.ReasonCode, reason: reason}) {
 				c.logger.Debug("mqtt.tcp.pubrec_error_replayed", slog.Uint64("packet_id", uint64(id)))
 			}
@@ -294,7 +334,16 @@ func (c *TCPClient) handlePubrec(l *link, ack *protocol.AckPacket, reason string
 		c.sendAck(l, protocol.Pubrel, id)
 		return
 	}
+	// No state for this identifier: the exchange was completed, aborted or
+	// discarded with a previous session. §4.3.3 still requires an answer —
+	// the sender keeps the message in flight until its PUBREL arrives, so a
+	// warn-and-continue leaves the broker retransmitting this PUBREC (and
+	// this branch re-logging) for the connection's lifetime. Release it with
+	// 0x92 Packet Identifier not found (§3.6.2.1), the reason code that says
+	// exactly what happened; on an MQTT 3.1.1 link the PUBREL carries no
+	// reason code and the bare packet unsticks the peer just the same.
 	c.logger.Warn("mqtt.tcp.pubrec_unknown_id", slog.Uint64("packet_id", uint64(id)))
+	c.sendAckReason(l, protocol.Pubrel, id, protocol.PacketIdentifierNotFound)
 }
 
 // handleSuback signals the Subscribe waiter with the first filter's reason
@@ -347,7 +396,9 @@ func (c *TCPClient) handleServerDisconnect(l *link, frame protocol.Frame) {
 		reason = dp.ReasonCode
 	}
 	c.logger.Warn("mqtt.tcp.server_disconnect", slog.String("reason", reason.String()))
-	c.teardownLink(l, false)
+	// A broker DISCONNECT arriving while our own Disconnect is in flight is
+	// part of the graceful shutdown, not a drop to reconnect from.
+	c.teardownLink(l, l.graceful.Load())
 }
 
 // protocolError tears the connection down as lost, preceded on MQTT 5.0 by
@@ -362,14 +413,21 @@ func (c *TCPClient) protocolError(l *link, reason protocol.ReasonCode) {
 		dp := &protocol.DisconnectPacket{Version: c.version, ReasonCode: reason}
 		_ = c.writeFrame(l, dp.Encode)
 	}
-	c.teardownLink(l, false)
+	c.teardownLink(l, l.graceful.Load())
 }
 
-// sendAck writes a PUBACK/PUBREC/PUBREL/PUBCOMP with a success reason code,
-// logging (but not tearing down on) a transient write failure — the read
-// loop will observe the socket error on its next read.
+// sendAck writes a PUBACK/PUBREC/PUBREL/PUBCOMP with a success reason code.
 func (c *TCPClient) sendAck(l *link, t protocol.PacketType, id uint16) {
-	ack := &protocol.AckPacket{Version: c.version, Type: t, PacketID: id}
+	c.sendAckReason(l, t, id, protocol.Success)
+}
+
+// sendAckReason writes a PUBACK/PUBREC/PUBREL/PUBCOMP carrying reason,
+// logging (but not tearing down on) a transient write failure — the read
+// loop will observe the socket error on its next read. On an MQTT 3.1.1
+// link the encoder omits the reason code (the dialect has none), so the
+// same call emits the plain two-byte acknowledgement body.
+func (c *TCPClient) sendAckReason(l *link, t protocol.PacketType, id uint16, reason protocol.ReasonCode) {
+	ack := &protocol.AckPacket{Version: c.version, Type: t, PacketID: id, ReasonCode: reason}
 	if err := c.writeFrame(l, ack.EncodeAck); err != nil && !isStopping(l) {
 		c.logger.Warn("mqtt.tcp.send_ack",
 			slog.String("type", t.String()), slog.String("err", err.Error()))
@@ -448,8 +506,13 @@ func toMessage(p *protocol.PublishPacket) *Message {
 // watchdog. Unanswered PINGREQs from previous ticks mean the socket is
 // half-open — the peer vanished without a FIN/RST, so readLoop would block
 // in ReadFrame forever — and once pingTimeoutThreshold accumulate the
-// connection is declared lost so the lifecycle reconnects. A zero interval
-// disables keep-alive entirely.
+// connection is declared lost so the lifecycle reconnects.
+//
+// A zero interval disables keep-alive entirely — the broker imposed a
+// Server Keep Alive of 0 (§3.1.2.10), see
+// [TCPClient.effectivePingInterval]. The loop is still started and simply
+// parks until teardown, so the link's wait-group accounting is the same on
+// every connection; with no PINGREQ ever sent the watchdog below is inert.
 func (c *TCPClient) keepAliveLoop(l *link) {
 	defer l.wg.Done()
 	if l.pingInterval <= 0 {
@@ -465,17 +528,29 @@ func (c *TCPClient) keepAliveLoop(l *link) {
 		case <-ticker.C:
 			if l.outstandingPings.Load() >= pingTimeoutThreshold {
 				c.logger.Warn("mqtt.tcp.ping_timeout")
-				c.teardownLink(l, false)
+				c.teardownLink(l, l.graceful.Load())
 				return
 			}
+			// Count the ping BEFORE it goes on the wire. The read loop
+			// answers a PINGRESP with Store(0); counting afterwards loses
+			// every PINGRESP that lands between the flush and the Add — the
+			// Store(0) is overwritten by an Add(1) for a ping that was in
+			// fact already answered, so the watchdog reaches its threshold
+			// after a single lost PINGRESP instead of the two it documents.
+			// Counting first can only overstate by one tick (the ping the
+			// write is about to fail on), and that path tears the link down
+			// anyway, so the counter never outlives it.
+			l.outstandingPings.Add(1)
 			if err := c.writeFrame(l, protocol.EncodePingReq); err != nil {
 				if !isStopping(l) {
 					c.logger.Warn("mqtt.tcp.ping", slog.String("err", err.Error()))
 				}
-				c.teardownLink(l, false)
+				// writeFrame already tore the link down honouring l.graceful;
+				// repeating it here is the closeOnce no-op that keeps the exit
+				// path uniform.
+				c.teardownLink(l, l.graceful.Load())
 				return
 			}
-			l.outstandingPings.Add(1)
 		}
 	}
 }

@@ -5,7 +5,7 @@ package mqtt
 
 // Small direct-unit gaps in session.go not otherwise reached:
 // StoredKind.String()'s full switch (only StoredPublish is exercised
-// indirectly by session_test.go) and idAllocator.Release's id==0 no-op.
+// indirectly by session_test.go) and idAllocator.ReleaseAt's id==0 no-op.
 
 import "testing"
 
@@ -35,12 +35,12 @@ func TestIDAllocatorReleaseZeroIsNoop(t *testing.T) {
 	t.Parallel()
 
 	a := &idAllocator{}
-	a.Release(0)
+	a.ReleaseAt(0, a.generation())
 	id, _, err := a.Acquire()
 	if err != nil {
-		t.Fatalf("acquire after Release(0): %v", err)
+		t.Fatalf("acquire after ReleaseAt(0): %v", err)
 	}
 	if id == 0 {
-		t.Fatal("Release(0) must not make identifier 0 acquirable")
+		t.Fatal("ReleaseAt(0) must not make identifier 0 acquirable")
 	}
 }
