@@ -34,7 +34,7 @@ func TestLifecycleReconnectsPromptlyAfterTCPReset(t *testing.T) {
 
 	b := newMockBroker(t)
 	c := NewTCPClient(newIntegrationConfig(b.URL(), "lc-reset"))
-	lc := NewLifecycle(LifecycleConfig{InitialBackoff: 3 * time.Second, MaxBackoff: 3 * time.Second}, c)
+	lc := NewLifecycle(LifecycleConfig{InitialBackoff: 3 * time.Second, MaxBackoff: 3 * time.Second, FlapWindow: time.Nanosecond}, c)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -72,7 +72,7 @@ func TestLifecyclePingWatchdogReconnectsAndRecovers(t *testing.T) {
 	// doc) so the watchdog trips well within the test budget instead of
 	// waiting out the 30s keep-alive floor.
 	c.pingInterval = 30 * time.Millisecond
-	lc := NewLifecycle(LifecycleConfig{InitialBackoff: 2 * time.Second, MaxBackoff: 2 * time.Second}, c)
+	lc := NewLifecycle(LifecycleConfig{InitialBackoff: 2 * time.Second, MaxBackoff: 2 * time.Second, FlapWindow: time.Nanosecond}, c)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -109,7 +109,7 @@ func TestLifecyclePingWatchdogToleratesSingleDroppedPing(t *testing.T) {
 	b := newMockBroker(t)
 	c := NewTCPClient(newIntegrationConfig(b.URL(), "lc-watchdog-tolerant"))
 	c.pingInterval = 30 * time.Millisecond
-	lc := NewLifecycle(LifecycleConfig{InitialBackoff: 2 * time.Second, MaxBackoff: 2 * time.Second}, c)
+	lc := NewLifecycle(LifecycleConfig{InitialBackoff: 2 * time.Second, MaxBackoff: 2 * time.Second, FlapWindow: time.Nanosecond}, c)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -145,7 +145,7 @@ func TestLifecycleServerKeepAliveOverridesPingCadenceAndWatchdogStillTrips(t *te
 	b.SetConnackProperties(&protocol.Properties{ServerKeepAlive: &ka})
 
 	c := NewTCPClient(newIntegrationConfig(b.URL(), "lc-ska")) // no pingInterval override
-	lc := NewLifecycle(LifecycleConfig{InitialBackoff: 2 * time.Second, MaxBackoff: 2 * time.Second}, c)
+	lc := NewLifecycle(LifecycleConfig{InitialBackoff: 2 * time.Second, MaxBackoff: 2 * time.Second, FlapWindow: time.Nanosecond}, c)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()

@@ -37,16 +37,27 @@ type LifecycleConfig struct {
 	InitialBackoff time.Duration
 	MaxBackoff     time.Duration
 	Jitter         time.Duration
-	Logger         *slog.Logger
+	// FlapWindow is the minimum uptime an established connection must
+	// have reached for a detected connection loss to trigger an
+	// immediate reconnect with a reset backoff. A connection that drops
+	// sooner counts as flapping — a broker that accepts the CONNECT and
+	// then closes the socket (a ClientID takeover fight, a connection
+	// limit, a draining load balancer) — and each consecutive flap
+	// doubles the pre-reconnect delay from InitialBackoff up to
+	// MaxBackoff instead of hammering the broker at full dial speed.
+	// Zero uses 10 seconds.
+	FlapWindow time.Duration
+	Logger     *slog.Logger
 }
 
 // DefaultLifecycle returns the MVP default timings: 1s → 30s
-// exponential backoff with ±500ms jitter.
+// exponential backoff with ±500ms jitter and a 10s flap window.
 func DefaultLifecycle() LifecycleConfig {
 	return LifecycleConfig{
 		InitialBackoff: 1 * time.Second,
 		MaxBackoff:     30 * time.Second,
 		Jitter:         500 * time.Millisecond,
+		FlapWindow:     10 * time.Second,
 	}
 }
 
@@ -74,6 +85,9 @@ func NewLifecycle(cfg LifecycleConfig, connector Connector) *Lifecycle {
 	}
 	if cfg.MaxBackoff == 0 {
 		cfg.MaxBackoff = DefaultLifecycle().MaxBackoff
+	}
+	if cfg.FlapWindow == 0 {
+		cfg.FlapWindow = DefaultLifecycle().FlapWindow
 	}
 	return &Lifecycle{cfg: cfg, connector: connector}
 }
@@ -176,17 +190,52 @@ func (l *Lifecycle) loop(ctx context.Context) {
 	}
 
 	backoff := l.cfg.InitialBackoff
+	// lastSuccess tracks when the current session was established; Start's
+	// synchronous first connect succeeded immediately before this loop was
+	// spawned. flapStreak counts consecutive connections that died within
+	// FlapWindow of being established — evidence of a flapping broker that
+	// accepts the CONNECT and then drops the socket, a failure mode the
+	// connect-error backoff below never sees because every Connect succeeds.
+	lastSuccess := time.Now()
+	flapStreak := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-lost:
-			// The adapter detected the socket dropped. Reconnect
-			// promptly instead of waiting out the timer — which, after
-			// an idle probe, may be a full MaxBackoff away — and reset
-			// the backoff to InitialBackoff so a link that just blipped
-			// re-establishes fast rather than at MaxBackoff.
-			backoff = l.cfg.InitialBackoff
+			if time.Since(lastSuccess) < l.cfg.FlapWindow {
+				// The link died within FlapWindow of coming up. An
+				// immediate retry with a reset backoff would reconnect a
+				// flapping broker at full dial speed, forever — the event
+				// channel re-arms on every drop, so exponential backoff
+				// could never engage. Wait out a delay that doubles with
+				// each consecutive flap instead.
+				flapStreak++
+				delay := l.cfg.InitialBackoff
+				for i := 1; i < flapStreak && delay < l.cfg.MaxBackoff; i++ {
+					delay *= 2
+				}
+				if delay > l.cfg.MaxBackoff {
+					delay = l.cfg.MaxBackoff
+				}
+				l.cfg.Logger.Warn("mqtt.reconnect_flap",
+					slog.Int("streak", flapStreak),
+					slog.Duration("delay", delay))
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(l.jittered(delay)):
+				}
+			} else {
+				// The adapter detected an established, previously stable
+				// socket dropped. Reconnect promptly instead of waiting
+				// out the timer — which, after an idle probe, may be a
+				// full MaxBackoff away — and reset the backoff to
+				// InitialBackoff so a link that just blipped
+				// re-establishes fast rather than at MaxBackoff.
+				flapStreak = 0
+				backoff = l.cfg.InitialBackoff
+			}
 		case <-time.After(l.jittered(backoff)):
 		}
 		if err := l.connectOnce(ctx); err != nil {
@@ -208,6 +257,7 @@ func (l *Lifecycle) loop(ctx context.Context) {
 			}
 			continue
 		}
+		lastSuccess = time.Now()
 		backoff = l.cfg.InitialBackoff
 	}
 }

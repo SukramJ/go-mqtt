@@ -8,6 +8,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/SukramJ/go-mqtt/protocol"
 )
 
 // ErrCircuitOpen is returned by [Breaker.Publish] while the circuit is
@@ -79,8 +81,10 @@ type BreakerConfig struct {
 // Countable failures are broker-side symptoms: acknowledgement
 // timeouts, [ErrConnectionLost], [ErrNotConnected] and broker rejects
 // ([*ReasonError]). Local conditions — caller context cancellation,
-// [ErrPacketTooLarge], [ErrPacketIDExhausted], client-side limit
-// violations — never trip the circuit.
+// [ErrPacketTooLarge], [ErrPacketIDExhausted], and client-side limit
+// violations (a [protocol.ErrProtocolViolation],
+// [protocol.ErrMalformedPacket] or [protocol.ErrStringTooLong] raised
+// before any bytes reach the wire) — never trip the circuit.
 //
 // A Breaker is safe for concurrent use and adds no overhead beyond one
 // mutex acquisition per publish.
@@ -248,6 +252,16 @@ func countableFailure(ctx context.Context, err error) bool {
 		errors.Is(err, ErrNotConnected):
 		return true
 	case errors.Is(err, ErrPacketTooLarge), errors.Is(err, ErrPacketIDExhausted):
+		return false
+	case errors.Is(err, protocol.ErrProtocolViolation),
+		errors.Is(err, protocol.ErrMalformedPacket),
+		errors.Is(err, protocol.ErrStringTooLong):
+		// Client-side validation and encode failures (invalid topic, QoS
+		// above the broker's Maximum QoS, retain against Retain
+		// Available = 0, oversized strings) surface before any bytes
+		// reach the wire — they say nothing about broker health, and
+		// counting them would let one malformed topic open the circuit
+		// for every healthy publish.
 		return false
 	case ctx.Err() != nil && errors.Is(err, ctx.Err()):
 		// The caller's own deadline/cancellation surfaced — not a

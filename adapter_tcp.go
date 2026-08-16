@@ -756,11 +756,23 @@ func (c *TCPClient) teardownLink(l *link, graceful bool) {
 		if l.conn != nil {
 			_ = l.conn.Close()
 		}
-		if !c.link.CompareAndSwap(l, nil) {
+		if c.link.Load() != l {
 			return
 		}
+		// Poison the shared session state BEFORE clearing the link pointer.
+		// The pointer is the only gate Connect checks: cleared first, a
+		// Connect landing between the clear and the fail calls below would
+		// establish a healthy new session whose quota this stale teardown
+		// then marks failed — permanently rejecting every QoS>0 publish on
+		// a link that reports IsConnected, with no reconnect to repair it
+		// (Connect keeps returning ErrAlreadyConnected). While the pointer
+		// still reads l, Connect refuses with ErrAlreadyConnected, so the
+		// order below closes that window. The pointer cannot change under
+		// us: Connect only stores over nil, and every other teardown of l
+		// is serialised by closeOnce.
 		c.failAllWaiters()
 		c.quota.fail()
+		c.link.Store(nil)
 		if !graceful {
 			select {
 			case c.lostCh <- struct{}{}:
