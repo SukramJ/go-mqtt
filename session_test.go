@@ -59,7 +59,7 @@ func TestIDAllocatorExhaustion(t *testing.T) {
 	}
 
 	// Freeing exactly one identifier makes it (and only it) allocatable.
-	a.Release(1234)
+	a.ReleaseAt(1234, a.generation())
 	id, _, err := a.Acquire()
 	if err != nil {
 		t.Fatalf("re-acquire after release: %v", err)
@@ -120,7 +120,7 @@ func TestIDAllocatorConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range 500 {
-				id, _, err := a.Acquire()
+				id, gen, err := a.Acquire()
 				if err != nil {
 					t.Errorf("acquire: %v", err)
 					return
@@ -135,7 +135,7 @@ func TestIDAllocatorConcurrent(t *testing.T) {
 				mu.Lock()
 				delete(held, id)
 				mu.Unlock()
-				a.Release(id)
+				a.ReleaseAt(id, gen)
 			}
 		}()
 	}
@@ -246,13 +246,14 @@ func TestQuotaBlockUnblockRelease(t *testing.T) {
 	t.Parallel()
 	q := newQuota(1)
 	ctx := context.Background()
-	if _, err := q.acquire(ctx); err != nil {
+	gen, err := q.acquire(ctx)
+	if err != nil {
 		t.Fatalf("first acquire: %v", err)
 	}
 	done := make(chan error, 1)
 	go func() { _, err := q.acquire(ctx); done <- err }()
 	assertNoReceive(t, done, 30*time.Millisecond)
-	q.release()
+	q.releaseAt(gen)
 	if err := assertReceive(t, done, time.Second); err != nil {
 		t.Fatalf("acquire after release: %v", err)
 	}
@@ -343,7 +344,8 @@ func TestQuotaConcurrentBound(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for range 200 {
-				if _, err := q.acquire(ctx); err != nil {
+				gen, err := q.acquire(ctx)
+				if err != nil {
 					t.Errorf("acquire: %v", err)
 					return
 				}
@@ -358,7 +360,7 @@ func TestQuotaConcurrentBound(t *testing.T) {
 					t.Errorf("in-flight %d exceeds ceiling %d", cur, ceiling)
 				}
 				inFlight.Add(-1)
-				q.release()
+				q.releaseAt(gen)
 			}
 		}()
 	}

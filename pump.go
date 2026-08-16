@@ -32,7 +32,12 @@ func (c *TCPClient) readLoop(l *link) {
 			if !isStopping(l) {
 				c.logger.Warn("mqtt.tcp.read", slog.String("err", err.Error()))
 			}
-			c.teardownLink(l, false)
+			// A caller Disconnect is a completely normal way to reach this
+			// branch: the broker closes the socket the moment it reads our
+			// DISCONNECT, so the read error races Disconnect's own teardown.
+			// Honour l.graceful or that race raises a lost-connection signal
+			// for an intentional shutdown and a [Lifecycle] reconnects.
+			c.teardownLink(l, l.graceful.Load())
 			return
 		}
 		if isStopping(l) {
@@ -41,10 +46,13 @@ func (c *TCPClient) readLoop(l *link) {
 			// reconnect may already have swapped in a new link that shares
 			// c.ids, c.quota and c.store. A bufio.Reader can still surface a
 			// pipelined PUBACK/PUBCOMP from the now-dead socket here; handling
-			// it would run completeOutbound/handlePubrec against the NEW link's
-			// allocator and quota (double-freeing a reused packet id,
-			// over-crediting the send quota past Receive Maximum). Drop it and
-			// exit — teardownLink has already run for this link.
+			// it would run completeOutbound/handlePubrec against the NEW
+			// session's store and waiter table, dropping a stored PUBLISH the
+			// new session owns and resolving its waiter with a stale
+			// acknowledgement. (The identifier and quota releases are
+			// generation-checked against this link, so those two survive the
+			// race on their own — this check is what protects the rest.) Drop
+			// the frame and exit — teardownLink has already run for this link.
 			return
 		}
 		if err := frame.ValidateFlags(); err != nil {
@@ -229,9 +237,9 @@ func (c *TCPClient) handleAck(l *link, frame protocol.Frame, t protocol.PacketTy
 	reason := reasonStringOf(ack.Properties)
 	switch t {
 	case protocol.Puback:
-		c.completeOutbound(ack.PacketID, StoredPublish, ackResult{code: ack.ReasonCode, reason: reason})
+		c.completeOutbound(l, ack.PacketID, StoredPublish, ackResult{code: ack.ReasonCode, reason: reason})
 	case protocol.Pubcomp:
-		c.completeOutbound(ack.PacketID, StoredPubrel, ackResult{code: ack.ReasonCode, reason: reason})
+		c.completeOutbound(l, ack.PacketID, StoredPubrel, ackResult{code: ack.ReasonCode, reason: reason})
 	case protocol.Pubrec:
 		c.handlePubrec(l, ack, reason)
 	default:
@@ -248,15 +256,22 @@ func (c *TCPClient) handleAck(l *link, frame protocol.Frame, t protocol.PacketTy
 // here is the one the original publishAcked goroutine intentionally left
 // held when the send outlived its caller (ctx cancel / ack timeout / a
 // connection drop that resumed the session).
-func (c *TCPClient) completeOutbound(id uint16, kind StoredKind, res ackResult) {
+//
+// The identifier and permit are freed against the generations l was
+// established under: a store call can block (a persistent [SessionStore] is
+// an explicitly supported extension point) long enough for this read loop to
+// outlive its own link, and an unguarded release would then free an
+// identifier the reconnected session already handed to another exchange and
+// credit that session's quota past the negotiated Receive Maximum.
+func (c *TCPClient) completeOutbound(l *link, id uint16, kind StoredKind, res ackResult) {
 	if !c.storeContains(id, kind) {
 		c.logger.Warn("mqtt.tcp.ack_unknown_id",
 			slog.Uint64("packet_id", uint64(id)), slog.String("kind", kind.String()))
 		return
 	}
 	_ = c.store.Delete(id, kind)
-	c.ids.Release(id)
-	c.quota.release()
+	c.ids.ReleaseAt(id, l.idGen)
+	c.quota.releaseAt(l.quotaGen)
 	if !c.signalWaiter(id, ackClassPublish, res) {
 		c.logger.Debug("mqtt.tcp.ack_replayed", slog.Uint64("packet_id", uint64(id)))
 	}
@@ -272,10 +287,13 @@ func (c *TCPClient) handlePubrec(l *link, ack *protocol.AckPacket, reason string
 	if c.storeContains(id, StoredPublish) {
 		if ack.ReasonCode.IsError() {
 			// Terminal abort of the exchange: drop the stored PUBLISH, free
-			// the id and release the send-quota permit it held.
+			// the id and release the send-quota permit it held — both against
+			// l's session generations, so a read loop that stalled in the
+			// store across a reconnect cannot corrupt the new session's
+			// accounting (see completeOutbound).
 			_ = c.store.Delete(id, StoredPublish)
-			c.ids.Release(id)
-			c.quota.release()
+			c.ids.ReleaseAt(id, l.idGen)
+			c.quota.releaseAt(l.quotaGen)
 			if !c.signalWaiter(id, ackClassPublish, ackResult{code: ack.ReasonCode, reason: reason}) {
 				c.logger.Debug("mqtt.tcp.pubrec_error_replayed", slog.Uint64("packet_id", uint64(id)))
 			}
@@ -347,7 +365,9 @@ func (c *TCPClient) handleServerDisconnect(l *link, frame protocol.Frame) {
 		reason = dp.ReasonCode
 	}
 	c.logger.Warn("mqtt.tcp.server_disconnect", slog.String("reason", reason.String()))
-	c.teardownLink(l, false)
+	// A broker DISCONNECT arriving while our own Disconnect is in flight is
+	// part of the graceful shutdown, not a drop to reconnect from.
+	c.teardownLink(l, l.graceful.Load())
 }
 
 // protocolError tears the connection down as lost, preceded on MQTT 5.0 by
@@ -362,7 +382,7 @@ func (c *TCPClient) protocolError(l *link, reason protocol.ReasonCode) {
 		dp := &protocol.DisconnectPacket{Version: c.version, ReasonCode: reason}
 		_ = c.writeFrame(l, dp.Encode)
 	}
-	c.teardownLink(l, false)
+	c.teardownLink(l, l.graceful.Load())
 }
 
 // sendAck writes a PUBACK/PUBREC/PUBREL/PUBCOMP with a success reason code,
@@ -465,14 +485,17 @@ func (c *TCPClient) keepAliveLoop(l *link) {
 		case <-ticker.C:
 			if l.outstandingPings.Load() >= pingTimeoutThreshold {
 				c.logger.Warn("mqtt.tcp.ping_timeout")
-				c.teardownLink(l, false)
+				c.teardownLink(l, l.graceful.Load())
 				return
 			}
 			if err := c.writeFrame(l, protocol.EncodePingReq); err != nil {
 				if !isStopping(l) {
 					c.logger.Warn("mqtt.tcp.ping", slog.String("err", err.Error()))
 				}
-				c.teardownLink(l, false)
+				// writeFrame already tore the link down honouring l.graceful;
+				// repeating it here is the closeOnce no-op that keeps the exit
+				// path uniform.
+				c.teardownLink(l, l.graceful.Load())
 				return
 			}
 			l.outstandingPings.Add(1)

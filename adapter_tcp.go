@@ -200,10 +200,23 @@ type link struct {
 	wg        sync.WaitGroup
 
 	// graceful is set by Disconnect before its best-effort DISCONNECT
-	// write, so a write failure inside writeFrame tears the link down
-	// without signalling a lost connection (which would trigger a spurious
-	// lifecycle reconnect after an intentional shutdown).
+	// write, so any teardown of this link — the failing write inside
+	// writeFrame, but equally the read loop seeing the broker close the
+	// socket in response to the DISCONNECT, or the keep-alive loop failing
+	// its ping — tears it down without signalling a lost connection (which
+	// would trigger a spurious lifecycle reconnect after an intentional
+	// shutdown). Every teardownLink call site outside Disconnect itself
+	// passes l.graceful.Load().
 	graceful atomic.Bool
+
+	// quotaGen and idGen are the send-quota and packet-identifier
+	// generations this link's session was established under (captured
+	// immediately after applySession). The read loop releases terminal-ack
+	// permits and identifiers against them, so a dispatch stalled in the
+	// store across a teardown + reconnect cannot free an identifier the NEW
+	// session owns or credit its quota past the negotiated Receive Maximum.
+	quotaGen uint64
+	idGen    uint64
 
 	aliases map[uint16]string
 
@@ -454,6 +467,13 @@ func (c *TCPClient) Connect(ctx context.Context) error {
 	}
 
 	c.applySession(result)
+	// Capture the session generations this link owns, AFTER applySession has
+	// re-seeded them: quota.reset bumps the quota generation on every
+	// connect, ids.Reset only on a discarded session, so reading both here
+	// pins the right pair for a resumed and a clean session alike. The read
+	// loop releases against these (see [link.quotaGen]).
+	l.quotaGen = c.quota.generation()
+	l.idGen = c.ids.generation()
 
 	// Replay stored QoS>0 state and prior subscriptions BEFORE publishing
 	// the link pointer: the spec requires unacknowledged PUBLISH/PUBREL

@@ -94,9 +94,29 @@ type Breaker struct {
 
 	mu       sync.Mutex
 	state    BreakerState
+	epoch    uint64
 	failures int
 	openedAt time.Time
 	probes   int
+}
+
+// admission is what a single admitted publish carries from admit to
+// record: the epoch it was let through under, and whether it holds one of
+// the half-open probe slots.
+//
+// The epoch makes stragglers harmless. A publish blocks for as long as the
+// broker takes (up to the full AckTimeout), so its outcome routinely lands
+// in a state the breaker has already left — and booking it against the new
+// state is wrong in both directions: a neutral outcome from a closed-state
+// publish would decrement a half-open probe count it never contributed to
+// (admitting more than HalfOpenMax concurrent probes), and a success from
+// before the trip would close the circuit on evidence that predates it.
+// Every transition bumps the epoch and re-seeds failures/probes
+// absolutely, so an outcome whose epoch no longer matches is simply
+// discarded.
+type admission struct {
+	epoch uint64
+	probe bool
 }
 
 // Compile-time contract: a Breaker is a drop-in Publisher.
@@ -128,68 +148,88 @@ func (b *Breaker) State() BreakerState {
 
 // Publish implements [Publisher] with circuit gating.
 func (b *Breaker) Publish(ctx context.Context, topic string, payload []byte, qos QoS, retain bool, opts ...PublishOption) error {
-	if admit, transition := b.admit(); !admit {
+	adm, admitted, transition := b.admit()
+	if !admitted {
 		return ErrCircuitOpen
-	} else if transition != nil {
+	}
+	if transition != nil {
 		transition()
 	}
 	err := b.pub.Publish(ctx, topic, payload, qos, retain, opts...)
-	if fire := b.record(ctx, err); fire != nil {
+	if fire := b.record(ctx, adm, err); fire != nil {
 		fire()
 	}
 	return err
 }
 
-// admit decides whether a publish may proceed. transition carries the
-// pending OnStateChange callback (to run outside the lock) when
+// admit decides whether a publish may proceed and, when it does, returns
+// the [admission] its outcome must be booked against. transition carries
+// the pending OnStateChange callback (to run outside the lock) when
 // admission itself transitioned the state (open → half-open).
-func (b *Breaker) admit() (admitted bool, transition func()) {
+func (b *Breaker) admit() (adm admission, admitted bool, transition func()) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	switch b.state {
 	case BreakerClosed:
-		return true, nil
+		return admission{epoch: b.epoch}, true, nil
 	case BreakerOpen:
 		if b.cfg.now().Sub(b.openedAt) < b.cfg.RecoveryTimeout {
-			return false, nil
+			return admission{}, false, nil
 		}
 		fire := b.transitionLocked(BreakerHalfOpen)
+		// Absolute, not an increment: entering half-open discards whatever
+		// probe accounting the previous state left behind, so a straggler
+		// that is about to be dropped for a stale epoch cannot strand a
+		// slot it appeared to hold.
 		b.probes = 1
-		return true, fire
+		return admission{epoch: b.epoch, probe: true}, true, fire
 	case BreakerHalfOpen:
 		if b.probes >= b.cfg.HalfOpenMax {
-			return false, nil
+			return admission{}, false, nil
 		}
 		b.probes++
-		return true, nil
+		return admission{epoch: b.epoch, probe: true}, true, nil
 	default:
-		return true, nil
+		return admission{epoch: b.epoch}, true, nil
 	}
 }
 
-// record books the publish outcome and returns the pending
-// OnStateChange callback, if any.
-func (b *Breaker) record(ctx context.Context, err error) func() {
+// record books the publish outcome against the state it was admitted in
+// and returns the pending OnStateChange callback, if any. An outcome from
+// a superseded epoch is discarded without touching failures, probes or
+// state.
+func (b *Breaker) record(ctx context.Context, adm admission, err error) func() {
 	switch {
 	case err == nil:
-		return b.recordSuccess()
+		return b.recordSuccess(adm)
 	case countableFailure(ctx, err):
-		return b.recordFailure()
+		return b.recordFailure(adm)
 	default:
-		// Local / caller-side condition: neutral. A half-open probe
-		// slot is released so the next publish may probe again.
+		// Local / caller-side condition: neutral. The half-open probe slot
+		// this publish actually holds is released so the next publish may
+		// probe again — a publish admitted in another epoch holds none.
 		b.mu.Lock()
 		defer b.mu.Unlock()
-		if b.state == BreakerHalfOpen && b.probes > 0 {
+		if adm.epoch != b.epoch {
+			return nil
+		}
+		if adm.probe && b.state == BreakerHalfOpen && b.probes > 0 {
 			b.probes--
 		}
 		return nil
 	}
 }
 
-func (b *Breaker) recordSuccess() func() {
+func (b *Breaker) recordSuccess(adm admission) func() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if adm.epoch != b.epoch {
+		// Stale evidence: this publish was admitted before the circuit
+		// changed state. Closing on it (or clearing the failure streak that
+		// accumulated since) would credit the current state with a probe it
+		// never ran.
+		return nil
+	}
 	b.failures = 0
 	if b.state == BreakerHalfOpen {
 		fire := b.transitionLocked(BreakerClosed)
@@ -199,9 +239,14 @@ func (b *Breaker) recordSuccess() func() {
 	return nil
 }
 
-func (b *Breaker) recordFailure() func() {
+func (b *Breaker) recordFailure(adm admission) func() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if adm.epoch != b.epoch {
+		// Stale evidence: the transition out of the admitting state already
+		// re-seeded the accounting this failure would contribute to.
+		return nil
+	}
 	switch b.state {
 	case BreakerHalfOpen:
 		// A failed probe re-opens immediately and restarts the window.
@@ -220,8 +265,11 @@ func (b *Breaker) recordFailure() func() {
 		}
 		return nil
 	case BreakerOpen:
-		// A straggler that was admitted before the trip; the window
-		// keeps its original start.
+		// Unreachable while the epoch matches: no publish is admitted in
+		// the open state except the one that transitions it to half-open,
+		// which bumps the epoch. Kept as the exhaustive-switch arm — and as
+		// the historical straggler case, which the epoch guard above now
+		// filters out before it can restart the recovery window.
 		return nil
 	default:
 		return nil
@@ -230,12 +278,16 @@ func (b *Breaker) recordFailure() func() {
 
 // transitionLocked switches the state and returns the OnStateChange
 // invocation to run once the lock is released. Callers hold b.mu.
+//
+// Every real transition bumps the epoch, retiring every publish still in
+// flight under the old state (see [admission]).
 func (b *Breaker) transitionLocked(to BreakerState) func() {
 	from := b.state
 	if from == to {
 		return nil
 	}
 	b.state = to
+	b.epoch++
 	if cb := b.cfg.OnStateChange; cb != nil {
 		return func() { cb(from, to) }
 	}

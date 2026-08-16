@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
 	"math/rand"
 	"sync"
 	"time"
@@ -34,9 +35,19 @@ type ConnectionNotifier interface {
 
 // LifecycleConfig governs the reconnect loop.
 type LifecycleConfig struct {
+	// InitialBackoff is the delay before the first reconnect attempt and
+	// the value the backoff resets to after a successful connect. Zero or
+	// negative uses 1 second.
 	InitialBackoff time.Duration
-	MaxBackoff     time.Duration
-	Jitter         time.Duration
+	// MaxBackoff caps the exponential growth. Zero or negative uses 30
+	// seconds; a value below InitialBackoff is raised to it.
+	MaxBackoff time.Duration
+	// Jitter is the maximum absolute deviation applied to every delay: the
+	// effective wait is drawn from [d-Jitter, d+Jitter) and then clamped to
+	// a floor of d/2, so a Jitter at or above the nominal delay cannot
+	// collapse it into an immediate retry (which would defeat the
+	// exponential growth entirely). Zero or negative disables jitter.
+	Jitter time.Duration
 	// FlapWindow is the minimum uptime an established connection must
 	// have reached for a detected connection loss to trigger an
 	// immediate reconnect with a reset backoff. A connection that drops
@@ -45,7 +56,7 @@ type LifecycleConfig struct {
 	// limit, a draining load balancer) — and each consecutive flap
 	// doubles the pre-reconnect delay from InitialBackoff up to
 	// MaxBackoff instead of hammering the broker at full dial speed.
-	// Zero uses 10 seconds.
+	// Zero or negative uses 10 seconds.
 	FlapWindow time.Duration
 	Logger     *slog.Logger
 }
@@ -80,14 +91,24 @@ func NewLifecycle(cfg LifecycleConfig, connector Connector) *Lifecycle {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	if cfg.InitialBackoff == 0 {
+	// Defaults apply to a negative value exactly as to the zero value: a
+	// negative duration would otherwise reach the loop unvalidated, where
+	// time.After fires instantly and the "backoff" is a busy reconnect
+	// spin.
+	if cfg.InitialBackoff <= 0 {
 		cfg.InitialBackoff = DefaultLifecycle().InitialBackoff
 	}
-	if cfg.MaxBackoff == 0 {
+	if cfg.MaxBackoff <= 0 {
 		cfg.MaxBackoff = DefaultLifecycle().MaxBackoff
 	}
-	if cfg.FlapWindow == 0 {
+	if cfg.FlapWindow <= 0 {
 		cfg.FlapWindow = DefaultLifecycle().FlapWindow
+	}
+	if cfg.MaxBackoff < cfg.InitialBackoff {
+		// An inverted pair would clamp every delay back down to the ceiling
+		// on the first doubling, so the backoff could never exceed a value
+		// the caller already considered too small.
+		cfg.MaxBackoff = cfg.InitialBackoff
 	}
 	return &Lifecycle{cfg: cfg, connector: connector}
 }
@@ -276,10 +297,22 @@ func (l *Lifecycle) connectOnce(ctx context.Context) error {
 	return nil
 }
 
+// jittered spreads d over [d-Jitter, d+Jitter) and clamps the result to a
+// floor of d/2. Without the floor a Jitter at or above d turns a large
+// share of the draws into a zero or negative delay — time.After fires
+// immediately — so the reconnect loop hammers the broker at dial speed and
+// the exponential growth never takes effect.
 func (l *Lifecycle) jittered(d time.Duration) time.Duration {
-	if l.cfg.Jitter <= 0 {
+	j := l.cfg.Jitter
+	if j <= 0 || j > math.MaxInt64/2 {
+		// A jitter past half the duration range would overflow the j*2
+		// span below into a non-positive value, which panics rand.Int63n.
 		return d
 	}
-	delta := time.Duration(rand.Int63n(int64(l.cfg.Jitter*2))) - l.cfg.Jitter //nolint:gosec // jitter only
-	return d + delta
+	delta := time.Duration(rand.Int63n(int64(j * 2))) //nolint:gosec // jitter only
+	out := d + delta - j
+	if floor := d / 2; out < floor {
+		out = floor
+	}
+	return out
 }
