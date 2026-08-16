@@ -180,12 +180,14 @@ func TestV5ReceiveMaximumBurst(t *testing.T) {
 
 // TestV5ServerKeepAliveOverride checks whether the broker returned a
 // Server Keep Alive override (property 0x13, §3.2.2.3.14) in the CONNACK.
-// Neither mosquitto nor emqx override a client's requested keep-alive
-// under this harness's default config (no `max_keepalive` directive is
-// set for mosquitto; see e2e/testdata/mosquitto.conf), so this is a
-// best-effort observation: when the broker doesn't exercise the override
-// the test skips gracefully instead of asserting a broker config this
-// harness doesn't actually provision.
+// e2e/testdata/mosquitto.conf sets `max_keepalive 40` globally, so this
+// mosquitto instance overrides the 45s request below to 40s. Still
+// asserted as a best-effort observation rather than a hard requirement:
+// a foreign broker run against this same test (e.g. a differently
+// configured mosquitto, or emqx, which is not provisioned with a
+// matching cap) may not exercise the override, and the test skips
+// gracefully in that case instead of asserting a broker config it
+// doesn't control.
 func TestV5ServerKeepAliveOverride(t *testing.T) {
 	t.Parallel()
 	brokerAddr := brokerURL(t, envMosquitto)
