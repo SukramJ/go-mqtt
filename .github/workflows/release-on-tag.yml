@@ -42,9 +42,15 @@ jobs:
       # without release notes.
       - name: Extract release notes from CHANGELOG.md
         run: |
-          awk -v ver="${VERSION}" '
-            $0 ~ "^## \\[" ver "\\]" { found = 1; next }
-            found && /^## \[/ { exit }
+          # Exact-string match, not regex: VERSION is interpolated
+          # unescaped, so a "." in it must stay a literal dot rather than
+          # a regex wildcard (which would let e.g. "1.2.0" match a
+          # "1x2y0" heading), and a version containing a regex
+          # metacharacter (+, *, () must not corrupt the pattern.
+          # index($0, hdr) == 1 checks a literal prefix match instead.
+          awk -v hdr="## [${VERSION}]" '
+            index($0, hdr) == 1 { found = 1; next }
+            found && index($0, "## [") == 1 { exit }
             found { print }
           ' CHANGELOG.md > RELEASE_NOTES.md
           if ! grep -q '[^[:space:]]' RELEASE_NOTES.md; then
