@@ -90,7 +90,7 @@ func TestLifecycleStopReturnsOnCtxDoneWhileLoopBusy(t *testing.T) {
 	s := &blockingConnector{lost: make(chan struct{}, 1), block: make(chan struct{})}
 	t.Cleanup(func() { close(s.block) })
 
-	cfg := LifecycleConfig{InitialBackoff: 10 * time.Second, MaxBackoff: 10 * time.Second, FlapWindow: time.Nanosecond}
+	cfg := LifecycleConfig{InitialBackoff: 10 * time.Second, MaxBackoff: 10 * time.Second, FlapWindow: -1}
 	l := NewLifecycle(cfg, s)
 	if err := l.Start(context.Background()); err != nil {
 		t.Fatalf("start: %v", err)

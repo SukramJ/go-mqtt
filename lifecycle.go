@@ -56,7 +56,11 @@ type LifecycleConfig struct {
 	// limit, a draining load balancer) — and each consecutive flap
 	// doubles the pre-reconnect delay from InitialBackoff up to
 	// MaxBackoff instead of hammering the broker at full dial speed.
-	// Zero or negative uses 10 seconds.
+	// Zero uses 10 seconds. A negative value disables flap detection
+	// entirely — every detected loss reconnects immediately with the
+	// backoff reset (the pre-1.3.0 behavior) — which is also what tests
+	// pin, since a positive window near zero is not decidable on
+	// platforms with a coarse monotonic clock.
 	FlapWindow time.Duration
 	Logger     *slog.Logger
 }
@@ -101,7 +105,10 @@ func NewLifecycle(cfg LifecycleConfig, connector Connector) *Lifecycle {
 	if cfg.MaxBackoff <= 0 {
 		cfg.MaxBackoff = DefaultLifecycle().MaxBackoff
 	}
-	if cfg.FlapWindow <= 0 {
+	if cfg.FlapWindow == 0 {
+		// Unlike the backoffs, a negative FlapWindow is meaningful: it is
+		// the documented "flap detection off" switch, so only the unset
+		// zero value takes the default.
 		cfg.FlapWindow = DefaultLifecycle().FlapWindow
 	}
 	if cfg.MaxBackoff < cfg.InitialBackoff {
@@ -269,7 +276,7 @@ func (l *Lifecycle) loop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-lost:
-			if time.Since(lastSuccess) < l.cfg.FlapWindow {
+			if l.cfg.FlapWindow > 0 && time.Since(lastSuccess) < l.cfg.FlapWindow {
 				// The link died within FlapWindow of coming up. An
 				// immediate retry with a reset backoff would reconnect a
 				// flapping broker at full dial speed, forever — the event

@@ -171,7 +171,7 @@ func TestLifecycleNotifierTriggersPromptReconnect(t *testing.T) {
 		InitialBackoff: 10 * time.Second, // timer path would not fire in-window
 		MaxBackoff:     10 * time.Second,
 		Jitter:         0,
-		FlapWindow:     time.Nanosecond, // the simulated link counts as stable
+		FlapWindow:     -1, // flap detection off: the simulated link counts as stable
 	}
 	l := NewLifecycle(cfg, s)
 
@@ -215,7 +215,7 @@ func TestLifecycleNotifierResetsBackoff(t *testing.T) {
 		InitialBackoff: 20 * time.Millisecond,
 		MaxBackoff:     3 * time.Second,
 		Jitter:         0,
-		FlapWindow:     time.Nanosecond, // the simulated link counts as stable
+		FlapWindow:     -1, // flap detection off: the simulated link counts as stable
 	}
 	l := NewLifecycle(cfg, s)
 

@@ -204,7 +204,7 @@ func TestLifecycleStableConnectionReconnectsImmediately(t *testing.T) {
 		InitialBackoff: 10 * time.Second, // timer path must play no part
 		MaxBackoff:     30 * time.Second,
 		Jitter:         -1,
-		FlapWindow:     time.Nanosecond, // any measurable uptime counts as stable
+		FlapWindow:     -1, // flap detection off: every loss counts as stable
 	}, s)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -683,8 +683,13 @@ func TestNewLifecycleValidatesNegativeAndInvertedConfig(t *testing.T) {
 	if neg.cfg.MaxBackoff != def.MaxBackoff {
 		t.Fatalf("MaxBackoff = %v, want the %v default", neg.cfg.MaxBackoff, def.MaxBackoff)
 	}
-	if neg.cfg.FlapWindow != def.FlapWindow {
-		t.Fatalf("FlapWindow = %v, want the %v default", neg.cfg.FlapWindow, def.FlapWindow)
+	// A negative FlapWindow is NOT defaulted: it is the documented "flap
+	// detection off" switch and must survive NewLifecycle untouched.
+	if neg.cfg.FlapWindow != -time.Hour {
+		t.Fatalf("FlapWindow = %v, want the negative disable value preserved", neg.cfg.FlapWindow)
+	}
+	if zero := NewLifecycle(LifecycleConfig{}, &stubConnector{}); zero.cfg.FlapWindow != def.FlapWindow {
+		t.Fatalf("zero FlapWindow = %v, want the %v default", zero.cfg.FlapWindow, def.FlapWindow)
 	}
 
 	inv := NewLifecycle(LifecycleConfig{
@@ -1159,7 +1164,7 @@ func TestLifecycleDrainsStaleConnectionLostToken(t *testing.T) {
 		InitialBackoff: 10 * time.Second, // the timer path must play no part
 		MaxBackoff:     30 * time.Second,
 		Jitter:         -1,
-		FlapWindow:     time.Nanosecond, // a loss event would reconnect immediately
+		FlapWindow:     -1, // flap detection off: a loss event would reconnect immediately
 	}, s)
 
 	ctx, cancel := context.WithCancel(context.Background())
