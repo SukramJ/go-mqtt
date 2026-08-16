@@ -141,8 +141,17 @@ type ConnectResult struct {
 	AssignedClientID string
 	// ServerKeepAlive is the keep-alive interval the broker imposed
 	// (MQTT 5.0 property 0x13); zero when the broker did not override the
-	// requested value.
+	// requested value. A zero value is ambiguous on its own — the broker
+	// may also have imposed a keep-alive of exactly zero, which §3.1.2.10
+	// defines as switching the keep-alive mechanism off — so read it
+	// together with ServerKeepAliveSet.
 	ServerKeepAlive time.Duration
+	// ServerKeepAliveSet reports whether the broker actually sent the
+	// Server Keep Alive property (0x13), disambiguating an absent property
+	// from a present zero. When it is true and ServerKeepAlive is zero the
+	// client sends no PINGREQ at all for this connection (§3.1.2.10), and
+	// with no pings outstanding the PINGRESP watchdog never fires either.
+	ServerKeepAliveSet bool
 	// ReceiveMaximum is the number of unacknowledged QoS 1/2 publishes the
 	// broker will accept concurrently (MQTT 5.0 property 0x21); defaults
 	// to 65535.

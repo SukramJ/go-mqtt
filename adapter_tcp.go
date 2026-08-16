@@ -343,6 +343,13 @@ func (c *TCPClient) LastConnectedAt() time.Time {
 
 // ConnectResult returns the negotiated session state from the most recent
 // successful connect. The bool is false before the first connect.
+//
+// "Successful" means the session was actually established: a connect that
+// fails — including one that dies during the pre-publish session replay —
+// leaves the previous result in place rather than reporting limits that
+// never took effect. For the same reason a [TCPClient.Disconnect] does not
+// clear it: the value keeps describing the last session that was live,
+// which is what a caller inspecting it after a drop wants.
 func (c *TCPClient) ConnectResult() (ConnectResult, bool) {
 	if p := c.result.Load(); p != nil {
 		return *p, true
@@ -434,14 +441,23 @@ func (c *TCPClient) Connect(ctx context.Context) error {
 	}
 	if err := validateConnackLimits(c.version, ack); err != nil {
 		// The broker advertised a §3.2.2.3 Protocol Error (Receive Maximum or
-		// Maximum Packet Size of 0). Refuse the session with a best-effort
-		// DISCONNECT(0x82) rather than proceeding with a corrupt send quota or
-		// packet-size limit.
-		dp := &protocol.DisconnectPacket{Version: c.version, ReasonCode: protocol.ProtocolErrorReason}
-		_ = dp.Encode(bw)
-		_ = bw.Flush()
-		_ = conn.Close()
-		return err
+		// Maximum Packet Size of 0). Refuse the session rather than proceeding
+		// with a corrupt send quota or packet-size limit.
+		return c.refuseConnack(conn, bw, err)
+	}
+	if c.cfg.CleanStart && ack.SessionPresent {
+		// [MQTT-3.2.2-4] (MQTT 3.1.1 §3.2.2.2): a CONNECT carrying Clean
+		// Start / Clean Session = 1 obliges the broker to answer with Session
+		// Present = 0. A broker that reports 1 is handing back session state
+		// this client asked it to discard — and has itself discarded locally
+		// (applySession resets the store, the identifiers and the quota on a
+		// clean start), so any QoS>0 exchange the broker still believes is in
+		// flight would be answered by acknowledgements for identifiers this
+		// side no longer knows. The spec's remedy is not to negotiate around
+		// it: the client MUST close the connection.
+		err := fmt.Errorf("mqtt/tcp: %w: broker reported Session Present=1 for a Clean Start connect",
+			protocol.ErrProtocolViolation)
+		return c.refuseConnack(conn, bw, err)
 	}
 	if !stop() {
 		// The caller's ctx was cancelled (or the deadline expired) while the
@@ -453,7 +469,6 @@ func (c *TCPClient) Connect(ctx context.Context) error {
 	_ = conn.SetDeadline(time.Time{})
 
 	result := c.buildConnectResult(ack)
-	c.result.Store(&result)
 
 	l := &link{
 		conn:         conn,
@@ -486,10 +501,19 @@ func (c *TCPClient) Connect(ctx context.Context) error {
 	if isStopping(l) {
 		// A replay write failed and tore the link down before it was ever
 		// published. Surface the failure instead of storing a dead link the
-		// loops would never clear.
+		// loops would never clear. c.result is deliberately still the PREVIOUS
+		// session's: publishing this connect's negotiated limits here would
+		// leave ConnectResult() — and the Maximum QoS / Retain Available gates
+		// Publish reads from it — describing a session that never existed.
 		return fmt.Errorf("mqtt/tcp: %w: connection lost during session replay", ErrConnectionLost)
 	}
 
+	// Publish the negotiated session only once it is certain to become the
+	// live one. Nothing between buildConnectResult and here reads c.result:
+	// applySession and effectivePingInterval take the value as a parameter,
+	// and the Publish gates that do read it are unreachable until the link
+	// pointer below is stored (they fail fast with ErrNotConnected).
+	c.result.Store(&result)
 	c.link.Store(l)
 	now := time.Now()
 	c.connectedAt.Store(&now)
@@ -503,6 +527,24 @@ func (c *TCPClient) Connect(ctx context.Context) error {
 		slog.String("version", c.version.String()),
 		slog.Bool("session_present", result.SessionPresent))
 	return nil
+}
+
+// refuseConnack aborts a connect whose CONNACK the spec forbids this
+// client from proceeding on (a §3.2.2.3 limit of 0, or Session Present = 1
+// against a Clean Start). On MQTT 5.0 it sends a best-effort
+// DISCONNECT(0x82 Protocol Error) so the broker learns why before the
+// socket closes; MQTT 3.1.1 has no reason code and defines DISCONNECT as a
+// CLEAN disconnect that disarms the will ([MQTT-3.14.4-3]), so there the
+// socket is simply closed — mirroring [TCPClient.protocolError]. err is
+// returned unchanged.
+func (c *TCPClient) refuseConnack(conn net.Conn, bw *bufio.Writer, err error) error {
+	if c.version == protocol.V50 {
+		dp := &protocol.DisconnectPacket{Version: c.version, ReasonCode: protocol.ProtocolErrorReason}
+		_ = dp.Encode(bw)
+		_ = bw.Flush()
+	}
+	_ = conn.Close()
+	return err
 }
 
 // connectAbortCause maps a socket error during the CONNECT/CONNACK
@@ -1052,6 +1094,11 @@ func buildWill(v protocol.Version, w *Will) *protocol.Will {
 // Publish — and a Maximum Packet Size of 0 (§3.2.2.3.6). Both surface an
 // error wrapping [protocol.ErrProtocolViolation]. On an MQTT 3.1.1 link (no
 // property block) it is always a no-op.
+//
+// Since the property decoder validates these value ranges itself
+// (ErrMalformedPacket from DecodeConnack), both branches below are
+// unreachable through Connect and remain purely as defence in depth for a
+// future decode path that bypasses the property table.
 func validateConnackLimits(v protocol.Version, ack *protocol.ConnackPacket) error {
 	if v != protocol.V50 || ack.Properties == nil {
 		return nil
@@ -1082,7 +1129,11 @@ func (c *TCPClient) buildConnectResult(ack *protocol.ConnackPacket) ConnectResul
 	}
 	res.AssignedClientID = p.AssignedClientID
 	if p.ServerKeepAlive != nil {
+		// ServerKeepAliveSet distinguishes an absent property from a present
+		// zero, which §3.1.2.10 defines as "keep-alive off" — see
+		// [ConnectResult.ServerKeepAliveSet].
 		res.ServerKeepAlive = time.Duration(*p.ServerKeepAlive) * time.Second
+		res.ServerKeepAliveSet = true
 	}
 	if p.ReceiveMaximum != nil {
 		res.ReceiveMaximum = *p.ReceiveMaximum
@@ -1103,11 +1154,26 @@ func (c *TCPClient) buildConnectResult(ack *protocol.ConnackPacket) ConnectResul
 	return res
 }
 
-// effectivePingInterval is the interval between PINGREQs. A broker Server
-// Keep Alive wins even below the client floor (spec §3.2.2.3.15 MUST);
-// otherwise it is half the requested keep-alive. The package-test override
-// takes precedence over both.
+// effectivePingInterval is the interval between PINGREQs, or zero when the
+// keep-alive mechanism is off.
+//
+// A broker Server Keep Alive wins even below the client floor (spec
+// §3.2.2.3.15 MUST). A Server Keep Alive of exactly 0 is not "absent": per
+// §3.1.2.10 a zero keep-alive turns the mechanism off entirely, so the
+// client must stop pinging — hence the [ConnectResult.ServerKeepAliveSet]
+// check, and hence that case outranks even the package-test override
+// (which exists only to drive the watchdog faster than the 30s keep-alive
+// floor, never to ping a broker that asked for silence). Otherwise the
+// interval is half the effective keep-alive.
+//
+// A zero result leaves keepAliveLoop parked on the link's stop channel for
+// the connection's lifetime: no PINGREQ is sent, so the PINGRESP watchdog
+// is inert too. The loop is still started so the link's wait-group
+// accounting (and therefore Disconnect's shutdown wait) stays uniform.
 func (c *TCPClient) effectivePingInterval(result ConnectResult) time.Duration {
+	if result.ServerKeepAliveSet && result.ServerKeepAlive == 0 {
+		return 0
+	}
 	if c.pingInterval > 0 {
 		return c.pingInterval
 	}

@@ -115,6 +115,25 @@ func NewLifecycle(cfg LifecycleConfig, connector Connector) *Lifecycle {
 
 // OnConnect registers a callback fired on every successful (re)connect.
 // Typical use: `bridge.AnnounceOnline` + resubscribe.
+//
+// Contract: callbacks run synchronously, in registration order, on the
+// goroutine that performed the connect — [Lifecycle.Start]'s caller
+// goroutine for the first connect, the reconnect loop's own goroutine for
+// every later one. The ctx handed to a callback is the loop's run context,
+// so it is cancelled when the lifecycle stops. Three consequences a
+// callback must respect:
+//
+//   - A panic is not contained. Nothing recovers it, so it unwinds the
+//     reconnect-loop goroutine and takes the process down. Recover inside
+//     the callback if the work can panic.
+//   - Blocking freezes reconnection. The loop cannot reach its next
+//     select while a callback runs, so a callback that waits on I/O of
+//     unbounded duration stalls every subsequent reconnect attempt.
+//     Hand slow work to a goroutine (and honour the ctx there).
+//   - Calling [Lifecycle.Stop] from inside a callback deadlocks. Stop
+//     waits for the reconnect loop to exit, and the loop cannot exit while
+//     it is running the callback. Signal a shutdown to another goroutine
+//     instead of calling Stop inline.
 func (l *Lifecycle) OnConnect(fn func(context.Context)) {
 	l.mu.Lock()
 	l.onConnect = append(l.onConnect, fn)
@@ -141,6 +160,32 @@ func (l *Lifecycle) Start(ctx context.Context) error {
 	l.cancel = cancel
 	l.started = true
 	l.mu.Unlock()
+
+	// Drain a connection-lost token buffered before this lifecycle ever
+	// connected. A [ConnectionNotifier]'s channel is buffered and survives
+	// the session that filled it: a [TCPClient] this Lifecycle is adopting
+	// after a caller-managed connect, or one a previous Lifecycle drove,
+	// hands over an already-signalled channel. loop()'s first select would
+	// then fire the lost branch immediately and reconnect an entirely
+	// healthy session — which returns ErrAlreadyConnected, and that answer
+	// parks the backoff at MaxBackoff, so the next genuine drop waits out
+	// the full ceiling before anything happens.
+	//
+	// The drain sits exactly here — after runCtx exists, immediately before
+	// the first connectOnce — because that instant is what makes "stale"
+	// decidable: a token present before this Lifecycle has connected even
+	// once can only describe a session it does not own, while a token that
+	// arrives during or after connectOnce describes the session it just
+	// established and MUST be kept. Draining after the connect would
+	// swallow that real one (a broker that accepts the CONNECT and drops
+	// the socket immediately); draining before runCtx exists would be the
+	// same instant but leave the cancel path half-built.
+	if n, ok := l.connector.(ConnectionNotifier); ok {
+		select {
+		case <-n.ConnectionLost():
+		default:
+		}
+	}
 
 	// First connect is synchronous so the caller can decide whether
 	// to proceed on a hard failure.

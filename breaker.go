@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// Copyright (C) 2026 go-mqtt authors.
+// Copyright (C) 2026 OpenCCU-Loom authors.
 
 package mqtt
 
@@ -63,6 +63,22 @@ type BreakerConfig struct {
 	// OnStateChange, when non-nil, is called synchronously after every
 	// state transition, outside the breaker's lock. Wire metrics or
 	// logging here.
+	//
+	// Calls are globally serialised and delivered in transition order, so
+	// the (from, to) pairs form an unbroken chain: every from equals the
+	// previous to, and a gauge driven from `to` can never be left showing
+	// a state the breaker has already left. Achieving that ordering means
+	// a callback is not necessarily invoked on the goroutine whose publish
+	// caused it: transitions are queued, and one goroutine drains the
+	// queue while the others carry on, so a publish may deliver another's
+	// transition — or see its own delivered by someone else and return
+	// before the callback has run. Callbacks never overlap.
+	//
+	// No breaker lock is held during the call: a callback may read
+	// [Breaker.State] or publish through this same Breaker without
+	// deadlocking (a transition it causes that way is queued and delivered
+	// after it returns, in order). Keep it quick anyway — it runs inline
+	// on a publish path.
 	OnStateChange func(from, to BreakerState)
 	// now is the clock seam for tests; nil uses time.Now.
 	now func() time.Time
@@ -98,6 +114,20 @@ type Breaker struct {
 	failures int
 	openedAt time.Time
 	probes   int
+	// pending is the FIFO queue of transitions awaiting their
+	// OnStateChange call, in the order they happened. Guarded by mu.
+	pending []stateChange
+	// draining marks that one goroutine is currently delivering the queue,
+	// making it the only one that may. Guarded by mu; see
+	// [Breaker.fireStateChanges].
+	draining bool
+}
+
+// stateChange is one queued (from, to) transition awaiting its
+// OnStateChange call.
+type stateChange struct {
+	from BreakerState
+	to   BreakerState
 }
 
 // admission is what a single admitted publish carries from admit to
@@ -276,11 +306,22 @@ func (b *Breaker) recordFailure(adm admission) func() {
 	}
 }
 
-// transitionLocked switches the state and returns the OnStateChange
-// invocation to run once the lock is released. Callers hold b.mu.
+// transitionLocked switches the state, queues the transition for its
+// OnStateChange call and returns the drain to run once the lock is
+// released. Callers hold b.mu.
 //
 // Every real transition bumps the epoch, retiring every publish still in
 // flight under the old state (see [admission]).
+//
+// The queue is what keeps callbacks in transition order. Returning a
+// closure that simply calls cb(from, to) was enough to keep the callback
+// off b.mu, but not to order two of them: goroutine A can transition
+// closed → open, be descheduled before invoking its closure, and let
+// goroutine B transition open → half-open and report first — leaving a
+// metrics gauge parked on "open" after the breaker has moved past it, and
+// a log that reads as if a state was entered twice. Appending under b.mu
+// fixes the order at the moment the state actually changes; the drain then
+// replays it faithfully.
 func (b *Breaker) transitionLocked(to BreakerState) func() {
 	from := b.state
 	if from == to {
@@ -288,10 +329,70 @@ func (b *Breaker) transitionLocked(to BreakerState) func() {
 	}
 	b.state = to
 	b.epoch++
-	if cb := b.cfg.OnStateChange; cb != nil {
-		return func() { cb(from, to) }
+	if b.cfg.OnStateChange == nil {
+		return nil
 	}
-	return nil
+	b.pending = append(b.pending, stateChange{from: from, to: to})
+	return b.fireStateChanges
+}
+
+// fireStateChanges delivers queued transitions FIFO, one at a time, with
+// no lock held across the callback — so a callback may safely inspect the
+// breaker ([Breaker.State]) or publish through it again.
+//
+// Exactly one goroutine drains at a time, marked by the draining flag
+// rather than a callback mutex: a second goroutine arriving mid-drain
+// returns immediately instead of queueing up behind the callback. That
+// keeps a slow callback from stalling publishes it has nothing to do with,
+// and — because a callback that publishes back through this Breaker
+// re-enters here on the same goroutine — makes reentrancy a no-op instead
+// of a self-deadlock on a non-reentrant mutex. Whatever it queues is
+// delivered by the drain loop already running, still in order.
+//
+// The consequence, documented on [BreakerConfig.OnStateChange], is that a
+// caller may deliver transitions other goroutines queued, and its own may
+// be delivered by someone else. The clear of draining shares the lock with
+// the emptiness check so no transition can be queued into a queue nobody
+// is about to drain.
+func (b *Breaker) fireStateChanges() {
+	b.mu.Lock()
+	if b.draining {
+		b.mu.Unlock()
+		return
+	}
+	b.draining = true
+	b.mu.Unlock()
+
+	// Normal exits clear draining under the same lock as the emptiness
+	// check (see below); this only covers a callback that panics, which
+	// would otherwise leave the flag set and silence every later
+	// transition. It must not fire on the normal path: by then another
+	// goroutine may already be draining, and clearing the flag under it
+	// would admit a second concurrent drain.
+	drained := false
+	defer func() {
+		if drained {
+			return
+		}
+		b.mu.Lock()
+		b.draining = false
+		b.mu.Unlock()
+	}()
+
+	for {
+		b.mu.Lock()
+		if len(b.pending) == 0 {
+			b.draining = false
+			drained = true
+			b.mu.Unlock()
+			return
+		}
+		next := b.pending[0]
+		b.pending = b.pending[1:]
+		cb := b.cfg.OnStateChange
+		b.mu.Unlock()
+		cb(next.from, next.to)
+	}
 }
 
 // countableFailure reports whether err is a broker-side symptom that

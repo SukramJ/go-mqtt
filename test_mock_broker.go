@@ -48,6 +48,15 @@ const mockAckTimeout = 5 * time.Second
 // connected.
 var errMockNotConnected = errors.New("mockbroker: no active connection")
 
+// mockAck is a recorded inbound acknowledgement (client -> broker):
+// PUBACK/PUBREC/PUBREL/PUBCOMP with the reason code it carried (Success
+// for the short v5 form, and always for MQTT 3.1.1, which has none).
+type mockAck struct {
+	Type       protocol.PacketType
+	PacketID   uint16
+	ReasonCode protocol.ReasonCode
+}
+
 // mockPublished is a recorded inbound PUBLISH (client -> broker).
 type mockPublished struct {
 	Topic      string
@@ -85,6 +94,10 @@ type mockBroker struct {
 	subFrames atomic.Int32
 	subMu     sync.Mutex
 	subs      []protocol.Subscription
+
+	// Inbound acknowledgement recording (PUBACK/PUBREC/PUBREL/PUBCOMP).
+	ackMu sync.Mutex
+	acks  []mockAck
 
 	// Inbound PUBLISH recording + ack-flow scripting.
 	pubMu           sync.Mutex
@@ -261,6 +274,7 @@ func (b *mockBroker) serve(l *mockLink) {
 				b.t.Errorf("mockbroker: decode PUBREL: %v", err)
 				return
 			}
+			b.recordAck(ack)
 			b.replyPubcomp(l, ack.PacketID)
 
 		case protocol.Puback:
@@ -269,6 +283,7 @@ func (b *mockBroker) serve(l *mockLink) {
 				b.t.Errorf("mockbroker: decode PUBACK: %v", err)
 				return
 			}
+			b.recordAck(ack)
 			l.resolve(l.pubacks, ack.PacketID)
 
 		case protocol.Pubrec:
@@ -277,6 +292,7 @@ func (b *mockBroker) serve(l *mockLink) {
 				b.t.Errorf("mockbroker: decode PUBREC: %v", err)
 				return
 			}
+			b.recordAck(ack)
 			// The broker is the original publisher of an injected QoS 2
 			// message: reply PUBREL right away and wait for PUBCOMP.
 			rel := &protocol.AckPacket{Version: l.version, Type: protocol.Pubrel, PacketID: ack.PacketID}
@@ -290,6 +306,7 @@ func (b *mockBroker) serve(l *mockLink) {
 				b.t.Errorf("mockbroker: decode PUBCOMP: %v", err)
 				return
 			}
+			b.recordAck(ack)
 			l.resolve(l.pubcomps, ack.PacketID)
 
 		case protocol.Pingreq:
@@ -1075,6 +1092,25 @@ func (b *mockBroker) recordPublished(p *protocol.PublishPacket) {
 		Retain: p.Retain, Dup: p.Dup, Properties: p.Properties,
 	})
 	b.pubMu.Unlock()
+}
+
+// recordAck appends one decoded inbound acknowledgement to the recording.
+func (b *mockBroker) recordAck(a *protocol.AckPacket) {
+	b.ackMu.Lock()
+	b.acks = append(b.acks, mockAck{Type: a.Type, PacketID: a.PacketID, ReasonCode: a.ReasonCode})
+	b.ackMu.Unlock()
+}
+
+// Acks returns every inbound PUBACK/PUBREC/PUBREL/PUBCOMP received across
+// every connection, in receive order — including its reason code, which is
+// what distinguishes a "did not have that identifier" answer (0x92) from a
+// Success the client cannot honestly claim.
+func (b *mockBroker) Acks() []mockAck {
+	b.ackMu.Lock()
+	defer b.ackMu.Unlock()
+	out := make([]mockAck, len(b.acks))
+	copy(out, b.acks)
+	return out
 }
 
 // Published returns every inbound PUBLISH received, in receive order.
