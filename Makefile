@@ -110,7 +110,7 @@ cover-check: ## per-package coverage gate (COVER_MIN percent, default 90); NOT p
 	exit $$status
 
 .PHONY: e2e-certs
-e2e-certs: ## generate the e2e CA + server TLS cert (idempotent)
+e2e-certs: ## generate the e2e CA + server TLS cert (idempotent unless expired/expiring soon)
 	$(GO) run ./e2e/gencert -out e2e/testdata/certs
 
 .PHONY: e2e-up
