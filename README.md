@@ -149,6 +149,36 @@ validation errors raised before any bytes reach the broker
 (`protocol.ErrProtocolViolation`, `protocol.ErrMalformedPacket`,
 `protocol.ErrStringTooLong`) are neutral.
 
+## Wiring helpers
+
+Decorating only half the client is the usual shape: a `Breaker` guards the
+publish path, while subscriptions go through the raw client — a breaker there
+would only delay resubscription after a reconnect without preventing anything.
+`SplitClient` joins the two halves back into one `Client`:
+
+```go
+client := mqtt.NewTCPClient(cfg)
+breaker := mqtt.NewBreaker(client, mqtt.BreakerConfig{})
+session := mqtt.SplitClient(breaker, client) // publish guarded, subscribe direct
+```
+
+`Lifecycle.Start` makes exactly one connect attempt and reports its outcome, so
+a caller can decide whether a broker that is not there at boot is fatal. A
+daemon usually wants to come up and keep trying instead:
+
+```go
+lc := mqtt.NewLifecycle(mqtt.LifecycleConfig{}, client)
+err := mqtt.ConnectWithRetry(ctx, lc, mqtt.RetryConfig{
+    InitialBackoff: time.Second,
+    MaxBackoff:     30 * time.Second,
+    Logger:         logger,
+})
+```
+
+It returns `ctx.Err()` on cancellation, so an orderly shutdown is
+distinguishable from a broker that never appeared. Once `Start` succeeds,
+reconnection is the `Lifecycle`'s own business and `ConnectWithRetry` returns.
+
 ## Testing
 
 ```sh

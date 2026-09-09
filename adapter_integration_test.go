@@ -235,6 +235,13 @@ func TestSessionReplayCleanStartDiscardsStore(t *testing.T) {
 
 	beforeReconnect := len(b.Published())
 	b.SetSessionPresent(false)
+	// The publish waiter is failed the moment the reset is seen, but the read
+	// loop clears the link a beat later. Reconnecting before that lands hits
+	// ErrAlreadyConnected — the same wait every other reset-then-reconnect test
+	// in this suite performs.
+	if !lcPoll(2*time.Second, func() bool { return !c.IsConnected() }) {
+		t.Fatal("client never cleared the link after the reset")
+	}
 	mustConnect(t, c)
 	defer func() { _ = c.Disconnect(context.Background()) }()
 

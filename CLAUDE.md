@@ -53,14 +53,14 @@ upgrade path and [CHANGELOG.md](./CHANGELOG.md) for what changed.
 ## Repository Structure
 
 ```
-client.go               package mqtt (root): Publisher/Subscriber/Client contracts, QoS/Message/MessageHandler, LegacyHandler
+client.go               package mqtt (root): Publisher/Subscriber/Client contracts, QoS/Message/MessageHandler, LegacyHandler, SplitClient
 options.go              PublishOption/SubscribeOption, SubscribeResult, ConnectResult, Will, TCPConfig-adjacent public types
 errors.go               sentinel errors (ErrNotConnected, ErrConnectionLost, ...) + *ReasonError
 adapter_tcp.go           TCPClient: TCPConfig, link struct, Connect/Disconnect, dial, session (re)establishment
 pump.go                  readLoop/keepAliveLoop: frame dispatch, inbound QoS 1/2 handling, topic-alias resolution, dispatch to subscribers
 publish.go               Publish/Subscribe/Unsubscribe: ack waiting, flow-control acquire, SUBSCRIBE/UNSUBSCRIBE request/ack plumbing
 session.go               SessionStore interface + memStore, idAllocator (packet-id bitmap), quota (send-quota semaphore)
-lifecycle.go             Lifecycle + ConnectionNotifier — reconnect loop, event-driven via a Connector's ConnectionLost(), exponential backoff + jitter
+lifecycle.go             Lifecycle + ConnectionNotifier — reconnect loop, event-driven via a Connector's ConnectionLost(), exponential backoff + jitter; Starter/RetryConfig/ConnectWithRetry
 tls_config.go            NewClientTLSConfig — safe tls.Config construction (mandatory ServerName)
 breaker.go               Breaker: circuit-breaking Publisher decorator (epoch-guarded state machine, ErrCircuitOpen fail-fast)
 test_mock_broker.go      in-package (non-_test.go) scripted multi-connection mock broker (v3.1.1 + v5), fault injection knobs
