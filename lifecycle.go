@@ -6,6 +6,7 @@ package mqtt
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math"
 	"math/rand"
@@ -367,4 +368,90 @@ func (l *Lifecycle) jittered(d time.Duration) time.Duration {
 		out = floor
 	}
 	return out
+}
+
+// Starter is the part of [Lifecycle] that [ConnectWithRetry] drives. It is an
+// interface rather than a *Lifecycle so a consumer can substitute a fake in
+// its own tests without standing up a broker.
+type Starter interface {
+	// Start performs the initial connect and boots whatever background
+	// reconnection the implementation provides.
+	Start(ctx context.Context) error
+}
+
+// RetryConfig tunes [ConnectWithRetry]. The zero value is usable and matches
+// [LifecycleConfig]'s defaults: 1 second growing to 30.
+type RetryConfig struct {
+	// InitialBackoff is the delay before the second attempt. Zero or
+	// negative uses 1 second.
+	InitialBackoff time.Duration
+	// MaxBackoff caps the exponential growth. Zero or negative uses 30
+	// seconds; a value below InitialBackoff is raised to it.
+	MaxBackoff time.Duration
+	// MaxAttempts bounds the number of Start calls. Zero or negative means
+	// retry until ctx is done — the right choice for a daemon, whose whole
+	// job is to keep trying.
+	MaxAttempts int
+	// Logger receives a warning per failed attempt. Nil disables logging.
+	Logger *slog.Logger
+}
+
+// ConnectWithRetry calls s.Start until it succeeds, ctx is done, or
+// cfg.MaxAttempts is exhausted, backing off exponentially between attempts.
+//
+// It exists because [Lifecycle.Start] deliberately makes exactly one connect
+// attempt and reports its outcome: the caller gets to decide whether a broker
+// that is not there at boot is fatal. A daemon almost never wants that — it
+// wants to come up and keep trying — but a tool that must fail loudly does,
+// and the single-attempt contract is what lets both exist. This helper is the
+// daemon half, written once instead of in every consumer.
+//
+// Once Start returns nil, reconnection is the Lifecycle's own business; this
+// function does not participate in it and returns immediately.
+//
+// The error returned on ctx cancellation is ctx.Err(), so a caller can tell an
+// orderly shutdown from a broker that never appeared. When MaxAttempts is
+// exhausted the last Start error is returned, wrapped so [errors.Is] against
+// the underlying cause still works.
+func ConnectWithRetry(ctx context.Context, s Starter, cfg RetryConfig) error {
+	initial := cfg.InitialBackoff
+	if initial <= 0 {
+		initial = time.Second
+	}
+	maxBackoff := cfg.MaxBackoff
+	if maxBackoff <= 0 {
+		maxBackoff = 30 * time.Second
+	}
+	if maxBackoff < initial {
+		maxBackoff = initial
+	}
+
+	backoff := initial
+	for attempt := 1; ; attempt++ {
+		err := s.Start(ctx)
+		if err == nil {
+			return nil
+		}
+		// A cancelled context outranks the Start error: the caller stopped
+		// waiting, and reporting the connect failure instead would make an
+		// orderly shutdown look like a broker problem.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if cfg.MaxAttempts > 0 && attempt >= cfg.MaxAttempts {
+			return fmt.Errorf("mqtt: connect gave up after %d attempts: %w", attempt, err)
+		}
+		if cfg.Logger != nil {
+			cfg.Logger.Warn("mqtt.connect_retry",
+				slog.Int("attempt", attempt),
+				slog.Duration("retry_in", backoff),
+				slog.String("err", err.Error()))
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff = min(2*backoff, maxBackoff)
+	}
 }

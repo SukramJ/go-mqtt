@@ -3,6 +3,34 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.4.0] - 2026-09-09
+
+Two additive helpers extracted from the consuming bridges, where each
+existed in four or five near-identical copies. No behavior changes.
+
+### Added
+
+- `SplitClient(Publisher, Subscriber) Client` joins a decorated
+  publisher and an undecorated subscriber into one `Client`. Every
+  `go-*2mqtt` bridge carried its own `mqttSession` struct doing exactly
+  this, so a `Breaker` could guard the publish path while subscriptions
+  went through the raw client.
+- `ConnectWithRetry(ctx, Starter, RetryConfig)` retries
+  `Lifecycle.Start` with exponential backoff until it succeeds, the
+  context is done, or `MaxAttempts` is reached. `Start` deliberately
+  makes a single attempt so a caller can treat a missing broker as
+  fatal; a daemon almost never wants that, and two bridges had written
+  the same `startMQTT` wrapper to say so. `Starter` is an interface, so
+  a consumer can substitute a fake without a broker.
+
+### Fixed
+
+- `TestSessionReplayCleanStartDiscardsStore` reconnected without first
+  waiting for the read loop to clear the link after `InjectTCPReset()`,
+  and could fail with `ErrAlreadyConnected` under load. It now performs
+  the same wait as every other reset-then-reconnect test in the suite.
+  Test-only; no production code was involved.
+
 ## [1.3.0] - 2026-08-16
 
 Audit release: a full-codebase adversarial review (four parallel

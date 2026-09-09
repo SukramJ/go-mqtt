@@ -169,3 +169,34 @@ func LegacyHandler(fn func(topic string, payload []byte, retained bool)) Message
 		fn(msg.Topic, msg.Payload, msg.Retain)
 	}
 }
+
+// SplitClient joins a [Publisher] and a [Subscriber] into one [Client].
+//
+// It exists because decorating only half the client is the common shape: a
+// bridge wraps its publisher in a [Breaker] so a broker outage fails fast,
+// but subscribes through the undecorated client, since a circuit breaker on
+// the subscribe path would only delay resubscription after a reconnect
+// without preventing anything. That leaves two values where the consumer's
+// own interfaces want one:
+//
+//	client := mqtt.NewTCPClient(cfg)
+//	breaker := mqtt.NewBreaker(client, mqtt.BreakerConfig{})
+//	session := mqtt.SplitClient(breaker, client)
+//
+// Both arguments must be non-nil; a nil one produces a Client that panics on
+// the corresponding call rather than at construction, which is the usual Go
+// treatment of a nil interface value.
+//
+// The returned Client holds the two arguments and adds no behavior of its
+// own — no locking, no buffering, no error translation. Whatever concurrency
+// guarantees p and s make are exactly the ones it makes.
+func SplitClient(p Publisher, s Subscriber) Client {
+	return splitClient{Publisher: p, Subscriber: s}
+}
+
+// splitClient is a value, not a pointer: it carries no mutable state, so
+// copying one is harmless and there is nothing for a nil receiver to guard.
+type splitClient struct {
+	Publisher
+	Subscriber
+}
