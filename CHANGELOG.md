@@ -3,6 +3,36 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.5.1] - 2026-09-12
+
+### Fixed
+
+- **An identifier-less PUBLISH was matched by topic against *stamped*
+  subscriptions**, which restored the doubled handler that
+  `WithSubscriptionID` was added to remove.
+
+  MQTT 5.0 §3.3.4 requires a server to include the identifier of
+  **every** subscription it forwarded a PUBLISH for, so a message
+  arriving with no identifier was forwarded for no stamped
+  subscription. Matching it by topic against one therefore delivered a
+  copy the broker never sent for it. Measured: one stamped overlapping
+  route plus one unstamped broad subscription on the same client, and a
+  single published message ran the stamped handler twice.
+
+  An identifier-less message now reaches only subscriptions that carry
+  no identifier. When every subscription is unstamped — an MQTT 3.1.1
+  link, or a client that never asked for an identifier — nothing
+  changes.
+
+  This fails **closed**: a broker or intermediary that accepts a
+  Subscription Identifier and does not stamp what it forwards will now
+  deliver nothing to a stamped subscription. That is deliberate — a
+  doubled command is worse than a dropped one, because the doubling is
+  invisible — and it is no longer silent: the drop is logged as
+  `mqtt.tcp.unstamped_publish_dropped` with the topic and the number of
+  stamped subscriptions, which is the only signature of a
+  non-compliant server the client can produce.
+
 ## [1.5.0] - 2026-09-12
 
 MQTT 5.0 Subscription Identifiers, so a client can tell which of its own
