@@ -128,6 +128,11 @@ type subscription struct {
 	handler MessageHandler
 	options protocol.SubscribeOptions
 	token   uint64
+	// subID is the MQTT 5.0 Subscription Identifier this subscription was
+	// registered with, or zero for none. It is what lets dispatch attribute
+	// a delivered PUBLISH to the subscription it arrived for instead of
+	// re-matching its topic against every filter -- see [dispatch].
+	subID uint32
 }
 
 // ackResult is delivered to a Publish/Subscribe waiter when its
@@ -679,6 +684,15 @@ func (c *TCPClient) replaySubscriptions(l *link) {
 			PacketID:      id,
 			Subscriptions: []protocol.Subscription{{Filter: s.filter, Options: s.options}},
 		}
+		// The identifier is replayed with the filter. A broker holds it as
+		// part of the subscription and forgets it with the session, so a
+		// replay that omitted it would leave the client re-matching topics
+		// again after a reconnect -- attribution silently working before
+		// the drop and silently not after it, which is worse than never
+		// having it.
+		if s.subID != 0 {
+			pkt.Properties = &protocol.Properties{SubscriptionIdentifiers: []uint32{s.subID}}
+		}
 		ch := c.registerWaiter(id, ackClassSuback)
 		if err := c.writeFrame(l, pkt.Encode); err != nil {
 			c.removeWaiter(id, ch)
@@ -923,20 +937,26 @@ func (c *TCPClient) failAllWaiters() {
 // handler and wire options for filter, and returns the fresh monotonic
 // token stamped on the registration so the caller can later detect whether
 // its registration is still current.
-func (c *TCPClient) addSubscription(filter string, options protocol.SubscribeOptions, handler MessageHandler) uint64 {
+func (c *TCPClient) addSubscription(
+	filter string, options protocol.SubscribeOptions, handler MessageHandler, subID uint32,
+) uint64 {
 	c.subsMu.Lock()
 	defer c.subsMu.Unlock()
 	c.subSeq++
 	token := c.subSeq
 	for i := range c.subs {
-		if c.subs[i].filter == filter {
-			c.subs[i].options = options
-			c.subs[i].handler = handler
-			c.subs[i].token = token
-			return token
+		if c.subs[i].filter != filter {
+			continue
 		}
+		c.subs[i].options = options
+		c.subs[i].handler = handler
+		c.subs[i].token = token
+		c.subs[i].subID = subID
+		return token
 	}
-	c.subs = append(c.subs, subscription{filter: filter, handler: handler, options: options, token: token})
+	c.subs = append(c.subs, subscription{
+		filter: filter, handler: handler, options: options, token: token, subID: subID,
+	})
 	return token
 }
 

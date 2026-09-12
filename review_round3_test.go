@@ -141,9 +141,9 @@ func TestUnsubscribeKeepsNewerRegistration(t *testing.T) {
 	t.Parallel()
 
 	c := NewTCPClient(TCPConfig{BrokerURL: "tcp://127.0.0.1:1", ClientID: "unsub-token"})
-	token1 := c.addSubscription("a/b", protocol.SubscribeOptions{QoS: 1}, func(*Message) {})
+	token1 := c.addSubscription("a/b", protocol.SubscribeOptions{QoS: 1}, func(*Message) {}, 0)
 	// A concurrent Subscribe supersedes the registration mid-flight.
-	token2 := c.addSubscription("a/b", protocol.SubscribeOptions{QoS: 2}, func(*Message) {})
+	token2 := c.addSubscription("a/b", protocol.SubscribeOptions{QoS: 2}, func(*Message) {}, 0)
 
 	c.removeSubscriptionIfCurrent("a/b", token1) // the older Unsubscribe resolves late
 	if snap, ok := c.snapshotSubscription("a/b"); !ok || snap.token != token2 {

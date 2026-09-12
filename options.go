@@ -94,6 +94,7 @@ type subscribeOptions struct {
 	noLocal           bool
 	retainAsPublished bool
 	retainHandling    RetainHandling
+	subscriptionID    uint32
 }
 
 // WithNoLocal sets the MQTT 5.0 No Local option: the broker does not
@@ -113,6 +114,36 @@ func WithRetainAsPublished() SubscribeOption {
 // whether retained messages are delivered at subscribe time.
 func WithRetainHandling(h RetainHandling) SubscribeOption {
 	return func(o *subscribeOptions) { o.retainHandling = h }
+}
+
+// WithSubscriptionID sets the MQTT 5.0 Subscription Identifier (§3.8.2.1.2)
+// for this subscription. The broker then stamps it onto every PUBLISH it
+// forwards for it, and [Message.SubscriptionIdentifiers] carries it back.
+//
+// It exists because without it a client cannot tell which of its own
+// subscriptions a delivered message arrived for, and that is not academic:
+// a broker sends one copy of a PUBLISH per matching subscription (§3.3.4),
+// so a client holding two overlapping filters receives two copies and — if
+// it decides delivery by re-matching the topic against every filter it
+// holds — invokes every matching handler for each copy. Two overlapping
+// filters then run a handler twice per published message. That was measured
+// against Mosquitto 2.1.2 on both dialects, and for a consumer whose
+// handler performs a write it means a command executes twice with nothing
+// logged.
+//
+// With an identifier set, [TCPClient] delivers a stamped message only to
+// the subscription that identifier names, so overlapping filters cost one
+// handler call per copy and each copy reaches exactly one handler. Choosing
+// distinct identifiers per subscription is therefore the difference between
+// a broker fan-out the client can attribute and one it can only guess at.
+//
+// The value must be in 1..268435455; zero means "no identifier" and is the
+// default. MQTT 3.1.1 carries no property block, so this option has no
+// effect there and the re-matching behaviour is all a v3.1.1 link has —
+// which is why a client that must be correct on both dialects cannot rely
+// on identifiers alone.
+func WithSubscriptionID(id uint32) SubscribeOption {
+	return func(o *subscribeOptions) { o.subscriptionID = id }
 }
 
 // SubscribeResult is the outcome of a [Subscriber.Subscribe] call, decoded

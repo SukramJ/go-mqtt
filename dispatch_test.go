@@ -21,6 +21,7 @@ package mqtt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -238,5 +239,180 @@ func TestInboundAuthTriggersProtocolErrorAndDrop(t *testing.T) {
 	}
 	if !lcPoll(time.Second, func() bool { return !c.IsConnected() }) {
 		t.Fatal("client still connected after an inbound AUTH")
+	}
+}
+
+// TestSubscriptionIDsAttributeTheBrokersFanOut is the measured reason
+// [WithSubscriptionID] exists.
+//
+// A broker sends one copy of a PUBLISH per matching subscription (§3.3.4).
+// Deciding delivery by re-matching each copy's topic against every filter
+// the client holds therefore multiplies: two overlapping filters, two
+// copies, both handlers on each copy — a handler runs twice per published
+// message. That was measured against Mosquitto 2.1.2 on both dialects, and
+// for a handler that performs a write it means the write happens twice with
+// nothing in any log.
+//
+// With identifiers, each copy reaches exactly the subscription the broker
+// forwarded it for. This test drives both copies the way a broker sends
+// them, so the assertion is on the number of handler runs rather than on
+// the shape of the matcher.
+func TestSubscriptionIDsAttributeTheBrokersFanOut(t *testing.T) {
+	t.Parallel()
+
+	b := newMockBroker(t)
+	c := NewTCPClient(newIntegrationConfig(b.URL(), "dispatch-subid"))
+	mustConnect(t, c)
+	defer func() { _ = c.Disconnect(context.Background()) }()
+
+	var mu sync.Mutex
+	runs := map[string]int{}
+	record := func(name string) MessageHandler {
+		return func(*Message) {
+			mu.Lock()
+			runs[name]++
+			mu.Unlock()
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	// Two filters that overlap on ccu/1/PRESS_SHORT/set — the granularity a
+	// consumer reaches for when it wants one subscription per command shape.
+	if _, err := c.Subscribe(ctx, "ccu/+/+/set", QoS0, record("shape"), WithSubscriptionID(7)); err != nil {
+		t.Fatalf("Subscribe(shape): %v", err)
+	}
+	if _, err := c.Subscribe(ctx, "ccu/+/PRESS_SHORT/set", QoS0, record("press"), WithSubscriptionID(9)); err != nil {
+		t.Fatalf("Subscribe(press): %v", err)
+	}
+
+	// The broker's fan-out: one copy per matching subscription, each
+	// stamped with the identifier of the subscription it was sent for.
+	for _, id := range []uint32{7, 9} {
+		props := &protocol.Properties{SubscriptionIdentifiers: []uint32{id}}
+		if err := b.InjectPublish("ccu/1/PRESS_SHORT/set", []byte("PRESS"), 0, false, props); err != nil {
+			t.Fatalf("InjectPublish(id=%d): %v", id, err)
+		}
+	}
+
+	if !lcPoll(3*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return runs["shape"] >= 1 && runs["press"] >= 1
+	}) {
+		t.Fatalf("handlers did not both run: %v", runs)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if runs["shape"] != 1 || runs["press"] != 1 {
+		t.Errorf("handler runs = %v, want exactly one each: two copies reaching "+
+			"two handlers apiece is the double-dispatch this option prevents", runs)
+	}
+}
+
+// TestUnknownSubscriptionIDIsNotBroadenedIntoATopicMatch pins that a
+// stamped message naming a subscription this process never registered is
+// dropped rather than falling back to matching its topic.
+//
+// The case is a session resumed from a previous run: the broker still holds
+// a subscription with an identifier, and the client that registered it is
+// gone. Falling back to a topic match would hand the message to whichever
+// handler happens to match, i.e. to code that never asked for it.
+func TestUnknownSubscriptionIDIsNotBroadenedIntoATopicMatch(t *testing.T) {
+	t.Parallel()
+
+	b := newMockBroker(t)
+	c := NewTCPClient(newIntegrationConfig(b.URL(), "dispatch-subid-unknown"))
+	mustConnect(t, c)
+	defer func() { _ = c.Disconnect(context.Background()) }()
+
+	var mu sync.Mutex
+	got := 0
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := c.Subscribe(ctx, "ccu/#", QoS0, func(*Message) {
+		mu.Lock()
+		got++
+		mu.Unlock()
+	}, WithSubscriptionID(4)); err != nil {
+		t.Fatalf("Subscribe: %v", err)
+	}
+
+	props := &protocol.Properties{SubscriptionIdentifiers: []uint32{99}}
+	if err := b.InjectPublish("ccu/1/state", []byte("x"), 0, false, props); err != nil {
+		t.Fatalf("InjectPublish: %v", err)
+	}
+	// Then a stamped message that IS ours, so the test proves the client is
+	// still delivering rather than merely asleep.
+	props = &protocol.Properties{SubscriptionIdentifiers: []uint32{4}}
+	if err := b.InjectPublish("ccu/1/state", []byte("x"), 0, false, props); err != nil {
+		t.Fatalf("InjectPublish(own): %v", err)
+	}
+
+	if !lcPoll(3*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return got >= 1
+	}) {
+		t.Fatal("the client's own stamped message never arrived")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got != 1 {
+		t.Errorf("handler runs = %d, want 1: an identifier this process never "+
+			"registered must not be broadened into a topic match", got)
+	}
+}
+
+// TestSubscriptionIDIsRefusedOnV311 pins that the option fails loudly on a
+// dialect that cannot carry it, rather than being dropped.
+//
+// MQTT 3.1.1 has no property block, so a silently ignored identifier would
+// leave a caller believing its deliveries are attributable while the client
+// is in fact still re-matching topics — which is the failure the option
+// exists to prevent, now invisible.
+func TestSubscriptionIDIsRefusedOnV311(t *testing.T) {
+	t.Parallel()
+
+	b := newMockBroker(t)
+	cfg := newIntegrationConfig(b.URL(), "dispatch-subid-v311")
+	cfg.ProtocolVersion = ProtocolV311
+	c := NewTCPClient(cfg)
+	mustConnect(t, c)
+	defer func() { _ = c.Disconnect(context.Background()) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err := c.Subscribe(ctx, "ccu/#", QoS0, func(*Message) {}, WithSubscriptionID(3))
+	if err == nil {
+		t.Fatal("Subscribe accepted a subscription identifier on an MQTT 3.1.1 link")
+	}
+	if !errors.Is(err, protocol.ErrProtocolViolation) {
+		t.Errorf("err = %v, want ErrProtocolViolation", err)
+	}
+}
+
+// TestSubscriptionIDRangeIsRefused pins the §3.8.2.1.2 bound. The property
+// is a variable byte integer, so it caps at four bytes; a caller's value is
+// refused here rather than at the encoder, so the error names the value the
+// caller chose instead of a frame it did not write.
+func TestSubscriptionIDRangeIsRefused(t *testing.T) {
+	t.Parallel()
+
+	b := newMockBroker(t)
+	c := NewTCPClient(newIntegrationConfig(b.URL(), "dispatch-subid-range"))
+	mustConnect(t, c)
+	defer func() { _ = c.Disconnect(context.Background()) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, err := c.Subscribe(ctx, "ccu/#", QoS0, func(*Message) {}, WithSubscriptionID(maxSubscriptionID+1))
+	if err == nil {
+		t.Fatal("Subscribe accepted an out-of-range subscription identifier")
+	}
+	if !errors.Is(err, protocol.ErrProtocolViolation) {
+		t.Errorf("err = %v, want ErrProtocolViolation", err)
 	}
 }

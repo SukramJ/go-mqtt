@@ -455,23 +455,63 @@ func (c *TCPClient) storeContains(id uint16, kind StoredKind) bool {
 	return false
 }
 
-// dispatch routes msg to every subscription whose filter matches, in
-// registration order. Matching handlers are copied out from under the
-// subscription lock before they run, so a handler is free to (re)subscribe
-// without deadlocking, while preserving the synchronous-in-read-loop
-// contract documented on [MessageHandler].
+// dispatch routes msg to the subscriptions it belongs to. Matching handlers
+// are copied out from under the subscription lock before they run, so a
+// handler is free to (re)subscribe without deadlocking, while preserving the
+// synchronous-in-read-loop contract documented on [MessageHandler].
+//
+// A PUBLISH carrying MQTT 5.0 Subscription Identifiers (§3.3.4) says which
+// subscriptions it was forwarded for, and those are then the only ones it
+// reaches. Everything else falls back to matching the topic against every
+// registered filter, which is all a v3.1.1 link or an identifier-less
+// subscription offers.
+//
+// The distinction is not cosmetic. A broker sends one copy of a PUBLISH per
+// matching subscription, so a client holding two overlapping filters gets
+// two copies — and re-matching each copy against every filter invokes both
+// handlers twice over, running a handler twice per published message. That
+// was measured against Mosquitto 2.1.2 on both dialects, and for a consumer
+// whose handler performs a write it means the write happens twice with
+// nothing in any log. Identifiers turn the broker's fan-out into something
+// the client can attribute; see [WithSubscriptionID].
+//
+// An identifier the client does not know is dropped rather than broadened
+// into a topic match: it names a subscription this process did not register
+// — a session resumed from a previous run, say — and guessing a handler for
+// it would deliver a message to code that never asked for it.
 func (c *TCPClient) dispatch(msg *Message) {
 	c.subsMu.RLock()
 	handlers := make([]MessageHandler, 0, len(c.subs))
-	for i := range c.subs {
-		if protocol.MatchTopic(c.subs[i].filter, msg.Topic) {
-			handlers = append(handlers, c.subs[i].handler)
+	if ids := msg.SubscriptionIdentifiers; len(ids) > 0 {
+		for i := range c.subs {
+			if c.subs[i].subID != 0 && containsID(ids, c.subs[i].subID) {
+				handlers = append(handlers, c.subs[i].handler)
+			}
+		}
+	} else {
+		for i := range c.subs {
+			if protocol.MatchTopic(c.subs[i].filter, msg.Topic) {
+				handlers = append(handlers, c.subs[i].handler)
+			}
 		}
 	}
 	c.subsMu.RUnlock()
 	for _, h := range handlers {
 		h(msg)
 	}
+}
+
+// containsID reports whether id is among the identifiers a PUBLISH carried.
+// A linear scan because the list is one entry in every case a broker
+// produces except a shared subscription overlap, and allocating a set per
+// inbound message on the read loop would cost more than it saves.
+func containsID(ids []uint32, id uint32) bool {
+	for _, got := range ids {
+		if got == id {
+			return true
+		}
+	}
+	return false
 }
 
 // toMessage projects a decoded PUBLISH (topic already alias-resolved) into
