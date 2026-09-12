@@ -255,6 +255,24 @@ func (c *TCPClient) Subscribe(ctx context.Context, filter string, qos QoS, handl
 		RetainAsPublished: so.retainAsPublished,
 		RetainHandling:    byte(so.retainHandling),
 	}
+	// §3.8.2.1.2 caps the identifier at a four-byte varint's range and
+	// forbids zero. Refused here rather than at the encoder so the caller
+	// sees its own bad value instead of a frame it did not write, and
+	// refused on v3.1.1 too: silently dropping the option would leave a
+	// caller believing its deliveries are attributable when they are not,
+	// which is the failure this option exists to prevent.
+	if so.subscriptionID != 0 {
+		if so.subscriptionID > maxSubscriptionID {
+			err := fmt.Errorf("%w: subscription identifier %d out of range 1..%d",
+				protocol.ErrProtocolViolation, so.subscriptionID, maxSubscriptionID)
+			return SubscribeResult{}, err
+		}
+		if c.version != protocol.V50 {
+			err := fmt.Errorf("%w: subscription identifiers require MQTT 5.0",
+				protocol.ErrProtocolViolation)
+			return SubscribeResult{}, err
+		}
+	}
 
 	// Register the handler BEFORE the SUBSCRIBE hits the wire. The broker
 	// may deliver matching messages — most notably the retained-message
@@ -263,14 +281,20 @@ func (c *TCPClient) Subscribe(ctx context.Context, filter string, qos QoS, handl
 	// so a post-SUBACK registration loses that race and the first messages
 	// are silently dropped for want of a handler. Rolled back on failure.
 	prev, replaced := c.snapshotSubscription(filter)
-	token := c.addSubscription(filter, options, handler)
+	token := c.addSubscription(filter, options, handler, so.subscriptionID)
 
 	res, err := c.requestAck(ctx, l, "SUBSCRIBE", ackClassSuback, func(id uint16) frameEncoder {
-		return &protocol.SubscribePacket{
+		pkt := &protocol.SubscribePacket{
 			Version:       c.version,
 			PacketID:      id,
 			Subscriptions: []protocol.Subscription{{Filter: filter, Options: options}},
 		}
+		if so.subscriptionID != 0 {
+			pkt.Properties = &protocol.Properties{
+				SubscriptionIdentifiers: []uint32{so.subscriptionID},
+			}
+		}
+		return pkt
 	})
 	if err != nil {
 		c.restoreSubscription(filter, prev, replaced, token)

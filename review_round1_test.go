@@ -250,11 +250,11 @@ func TestConcurrentSubscribeRollbackKeepsSucceedingRegistration(t *testing.T) {
 
 	// A registers first (no prior entry).
 	prevA, replA := c.snapshotSubscription("f")
-	tokA := c.addSubscription("f", protocol.SubscribeOptions{QoS: 1}, func(*Message) {})
+	tokA := c.addSubscription("f", protocol.SubscribeOptions{QoS: 1}, func(*Message) {}, 0)
 
 	// B registers next, superseding A, and its SUBACK succeeds.
 	c.snapshotSubscription("f")
-	tokB := c.addSubscription("f", protocol.SubscribeOptions{QoS: 2}, func(*Message) {})
+	tokB := c.addSubscription("f", protocol.SubscribeOptions{QoS: 2}, func(*Message) {}, 0)
 	if tokB == tokA {
 		t.Fatal("addSubscription did not bump the token")
 	}
@@ -283,7 +283,7 @@ func TestSubscribeRollbackRemovesWhenStillCurrent(t *testing.T) {
 
 	c := NewTCPClient(TCPConfig{BrokerURL: "tcp://127.0.0.1:1", ClientID: "sub-rollback"})
 	prev, repl := c.snapshotSubscription("f")
-	tok := c.addSubscription("f", protocol.SubscribeOptions{QoS: 1}, func(*Message) {})
+	tok := c.addSubscription("f", protocol.SubscribeOptions{QoS: 1}, func(*Message) {}, 0)
 	c.restoreSubscription("f", prev, repl, tok)
 
 	c.subsMu.RLock()

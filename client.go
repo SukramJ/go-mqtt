@@ -39,6 +39,12 @@ const (
 	ProtocolV50 ProtocolVersion = protocol.V50
 )
 
+// maxSubscriptionID is the largest MQTT 5.0 Subscription Identifier
+// (§3.8.2.1.2): the property is a variable byte integer, which caps at four
+// bytes, and zero is forbidden. Used to refuse a caller's value before it
+// reaches the encoder, so the error names the value the caller chose.
+const maxSubscriptionID = 268435455
+
 // ReasonCode is a single-byte MQTT 5.0 reason code (§2.4), surfaced on
 // results and on [ReasonError]. It aliases [protocol.ReasonCode]. Values
 // >= 0x80 denote failure (see [protocol.ReasonCode.IsError]).

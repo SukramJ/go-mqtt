@@ -3,6 +3,54 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.5.0] - 2026-09-12
+
+MQTT 5.0 Subscription Identifiers, so a client can tell which of its own
+subscriptions a delivered message arrived for. Additive: a caller that
+does not ask for one sees exactly the previous behaviour.
+
+### Added
+
+- `WithSubscriptionID(id uint32)` sets the Subscription Identifier
+  (§3.8.2.1.2) on a single `Subscribe` call, and `dispatch` then
+  delivers a stamped PUBLISH only to the subscription that identifier
+  names.
+
+  The measured reason: a broker sends one copy of a PUBLISH **per
+  matching subscription** (§3.3.4), and deciding delivery by
+  re-matching each copy's topic against every registered filter
+  multiplies the two. Two overlapping filters, two copies, both
+  handlers on each copy — a handler runs twice per published message.
+  That was measured against Mosquitto 2.1.2 on both dialects while
+  tracking down a consumer whose command handler performed its write
+  twice, with nothing in any log. Identifiers turn the broker's
+  fan-out into something the client can attribute.
+
+  Three deliberate refusals, each because the silent alternative is
+  worse than an error:
+  - An identifier the client never registered is **dropped**, not
+    broadened into a topic match. It names a subscription this process
+    did not create — a session resumed from a previous run — and
+    guessing a handler for it would deliver a message to code that
+    never asked for it.
+  - The option is **refused on an MQTT 3.1.1 link** rather than
+    ignored. That dialect has no property block, so a silently dropped
+    identifier would leave a caller believing its deliveries are
+    attributable while the client is still re-matching topics — the
+    exact failure the option exists to prevent, now invisible.
+  - A value outside 1..268435455 is refused **before** the encoder, so
+    the error names the value the caller chose instead of a frame it
+    did not write.
+
+  The identifier is replayed with its filter on reconnect. A broker
+  holds it as part of the subscription and forgets it with the
+  session, so a replay that omitted it would leave attribution
+  silently working before a drop and silently not after it.
+
+  Note for a client that must be correct on both dialects: identifiers
+  are MQTT 5.0 only, so they are an improvement on a v5 link and not a
+  substitute for keeping overlapping filters disjoint.
+
 ## [1.4.0] - 2026-09-09
 
 Two additive helpers extracted from the consuming bridges, where each
