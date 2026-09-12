@@ -416,3 +416,74 @@ func TestSubscriptionIDRangeIsRefused(t *testing.T) {
 		t.Errorf("err = %v, want ErrProtocolViolation", err)
 	}
 }
+
+// TestUnstampedPublishSkipsStampedSubscriptions closes a hole an
+// adversarial review measured in the identifier routing.
+//
+// §3.3.4 requires a server to include the identifier of *every*
+// subscription it forwarded a PUBLISH for. So a message arriving with no
+// identifier was forwarded for no stamped subscription — and matching it
+// by topic against one delivers a copy the broker never sent for it.
+// That is the doubling identifiers exist to remove, reintroduced through
+// the fallback: with one stamped overlapping route and one unstamped
+// broad subscription on the same client, a single published message was
+// measured running a stamped handler twice.
+//
+// Failing closed is the deliberate choice. A doubled command is worse
+// than a dropped one, because the doubling is invisible while the drop
+// is a warning line.
+func TestUnstampedPublishSkipsStampedSubscriptions(t *testing.T) {
+	t.Parallel()
+
+	b := newMockBroker(t)
+	c := NewTCPClient(newIntegrationConfig(b.URL(), "dispatch-unstamped"))
+	mustConnect(t, c)
+	defer func() { _ = c.Disconnect(context.Background()) }()
+
+	var mu sync.Mutex
+	runs := map[string]int{}
+	record := func(name string) MessageHandler {
+		return func(*Message) {
+			mu.Lock()
+			runs[name]++
+			mu.Unlock()
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := c.Subscribe(ctx, "ccu/+/+/set", QoS0, record("stamped"), WithSubscriptionID(5)); err != nil {
+		t.Fatalf("Subscribe(stamped): %v", err)
+	}
+	// A second subscription on the same client with no identifier — the
+	// shape a consumer produces by adding a broad diagnostic subscribe
+	// beside an attributing command router.
+	if _, err := c.Subscribe(ctx, "ccu/#", QoS0, record("broad")); err != nil {
+		t.Fatalf("Subscribe(broad): %v", err)
+	}
+
+	// The broker's copy for the unstamped subscription carries no
+	// identifier, exactly as §3.3.4 prescribes.
+	if err := b.InjectPublish("ccu/1/PRESS_SHORT/set", []byte("PRESS"), 0, false, nil); err != nil {
+		t.Fatalf("InjectPublish(unstamped): %v", err)
+	}
+
+	if !lcPoll(3*time.Second, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return runs["broad"] >= 1
+	}) {
+		t.Fatal("the unstamped subscription never received its own copy")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if runs["broad"] != 1 {
+		t.Errorf("broad handler ran %d times, want 1", runs["broad"])
+	}
+	if runs["stamped"] != 0 {
+		t.Errorf("stamped handler ran %d times for a message carrying no identifier, want 0: "+
+			"a topic match against a stamped subscription is the doubling identifiers remove",
+			runs["stamped"])
+	}
+}
