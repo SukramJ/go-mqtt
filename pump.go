@@ -482,6 +482,7 @@ func (c *TCPClient) storeContains(id uint16, kind StoredKind) bool {
 func (c *TCPClient) dispatch(msg *Message) {
 	c.subsMu.RLock()
 	handlers := make([]MessageHandler, 0, len(c.subs))
+	stamped := 0
 	if ids := msg.SubscriptionIdentifiers; len(ids) > 0 {
 		for i := range c.subs {
 			if c.subs[i].subID != 0 && containsID(ids, c.subs[i].subID) {
@@ -489,13 +490,42 @@ func (c *TCPClient) dispatch(msg *Message) {
 			}
 		}
 	} else {
+		// No identifier means this message was forwarded for no
+		// identified subscription: §3.3.4 requires the server to include
+		// the identifier of EVERY subscription it forwarded a PUBLISH
+		// for. So a topic match against a stamped subscription would
+		// deliver a copy the broker did not send for it — which is the
+		// doubling that identifiers exist to remove, reintroduced through
+		// the fallback. Only unstamped subscriptions are candidates here.
 		for i := range c.subs {
+			if c.subs[i].subID != 0 {
+				stamped++
+				continue
+			}
 			if protocol.MatchTopic(c.subs[i].filter, msg.Topic) {
 				handlers = append(handlers, c.subs[i].handler)
 			}
 		}
 	}
 	c.subsMu.RUnlock()
+	if len(handlers) == 0 && stamped > 0 {
+		// Failing closed is deliberate: a doubled command is worse than a
+		// dropped one, because the doubling is invisible and the drop is
+		// this line. It is also the signature of a broker or intermediary
+		// that accepted a Subscription Identifier and did not stamp the
+		// messages it forwarded — which no compliant server does, and
+		// which nothing else in the client can detect.
+		//
+		// The topic is deliberately NOT logged. Everything read off the
+		// connection is, to a static analyser, indistinguishable from the
+		// password this client wrote to the same connection during
+		// CONNECT, so logging any of it raises a clear-text-logging
+		// finding that a reader then has to re-derive. The count alone
+		// still names the condition, and a consumer that wants the topic
+		// has its own handlers to log from.
+		c.logger.Warn("mqtt.tcp.unstamped_publish_dropped",
+			slog.Int("stamped_subscriptions", stamped))
+	}
 	for _, h := range handlers {
 		h(msg)
 	}
