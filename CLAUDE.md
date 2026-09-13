@@ -161,7 +161,30 @@ e2e/gencert/             standalone `go run` program generating the e2e CA + ser
     broker `Server Keep Alive` override reschedules the ping interval
     (spec MUST) even below the client's 30s floor.
   - **Dispatch** (`pump.go`): delivers to **every** matching
-    subscription, in registration order (an ordered slice, not a map).
+    subscription, in registration order (an ordered slice, not a map) —
+    with the subscription-identifier split below layered on top.
+  - **Subscription identifiers** (v5 only, `WithSubscriptionID`):
+    `dispatch` has two paths and they do not overlap. A PUBLISH that
+    carries identifiers goes to the subscriptions those identifiers
+    name, and to nothing else (an unregistered identifier is dropped,
+    not broadened into a topic match). A PUBLISH that carries none is
+    topic-matched against **unstamped subscriptions only**, because
+    §3.3.4 requires the server to include the identifier of every
+    subscription it forwarded for — so matching it into a stamped one
+    would deliver a copy the broker never sent for it, which is the
+    doubled handler the feature exists to remove. This **fails closed**:
+    against a broker or intermediary that accepts an identifier and then
+    does not stamp what it forwards, a stamped subscription receives
+    nothing, and the only signal is one
+    `mqtt.tcp.unstamped_publish_dropped` warning per dropped message —
+    deliberately without the topic (anything read off the connection is
+    indistinguishable, to a static analyser, from the password written
+    to that same connection during CONNECT). The option is **refused**,
+    not ignored, on a v3.1.1 link and for a value outside
+    `1..268435455`. Read `README.md`'s *Subscription identifiers*
+    section and the v1.5.0/v1.5.1 CHANGELOG entries before touching
+    `dispatch`; `review_round*_test.go` and the v1.5.1 regression pin
+    both paths.
   - **`ConnectionLost()`** exposes a buffered, non-blocking channel so
     `Lifecycle` reacts immediately instead of polling `IsConnected()`.
   - **Fail-fast**: `Publish`/`Subscribe`/`Unsubscribe` return
@@ -357,11 +380,24 @@ discussion, they were explicitly scoped out:
 
 ## Consumers and Compatibility
 
-This module is imported by (at least) `go-mtec2mqtt`,
-`go-zendure2mqtt`, `go-homeconnect2mqtt`, **and `openccu-loom`** (the
-project this client was originally written for and later carved out
-of — it consumes the extracted module too, not just the three
-bridges). **A breaking change here breaks all four at once.** Practical
+This module has **seven** consumers, every one of them currently pinned
+to the same release (verified against each repository's `go.mod` on
+`origin/main`, not from memory — re-check it the same way before
+trusting this list):
+
+- `openccu-loom` — the project this client was originally written for
+  and later carved out of; it consumes the extracted module too.
+- `go-mtec2mqtt`, `go-zendure2mqtt`, `go-homeconnect2mqtt`,
+  `go-daikin2mqtt`, `go-unifi2mqtt` — the bridge family.
+- **`go-hamqtt`** — the shared Home Assistant model/discovery/publisher
+  module (ADR 0070). It is the most consequential consumer, because it
+  sits *between* this module and the other six: all six import
+  `go-hamqtt`, and `go-hamqtt`'s `publisher/gomqtt` is where its
+  transport meets this client. A break here can therefore reach a
+  bridge twice — directly, and again through `go-hamqtt`'s pin.
+
+**A breaking change here breaks all seven at once**, and the ones that
+go through `go-hamqtt` need that module to move first. Practical
 implications:
 
 - Follow SemVer discipline strictly. Any change to an exported

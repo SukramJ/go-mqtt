@@ -3,6 +3,53 @@
 All notable changes to this project are documented in this file. The
 format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Documentation
+
+No code changes: nothing exported moves, nothing on the wire changes,
+and there is no reason for a consumer to re-pin. Not tagged for that
+reason — the next release folds this section in.
+
+- **`WithSubscriptionID` is documented.** It appeared in v1.5.0 and
+  changed behaviour in v1.5.1 without a single mention in `README.md` or
+  `CLAUDE.md`, for the one feature in this module that can make a
+  subscription deliver nothing. README gains a *Subscription
+  identifiers* section covering the mechanism (§3.3.4: a server MUST
+  include the identifier of every subscription it forwarded a PUBLISH
+  for), the reason it exists (one PUBLISH copy per matching
+  subscription, so topic re-matching runs every matching handler on
+  every copy — two overlapping filters means a handler runs twice per
+  message, measured against Mosquitto 2.1.2), and the fail-closed trade
+  stated plainly: against a broker or intermediary that accepts an
+  identifier and then does not stamp what it forwards, **a stamped
+  subscription receives nothing**, and the only signal is
+  `mqtt.tcp.unstamped_publish_dropped`. It is written as a condition a
+  reader can check against their own deployment — watch for that line
+  after a subscribe that sets an identifier — rather than as a claim
+  about any particular broker.
+
+  `CLAUDE.md` gains the same split under `TCPClient`, as the invariant a
+  future change to `dispatch` must not break: identifier-carrying and
+  identifier-less PUBLISHes take two non-overlapping paths, and the
+  second one must never reach a stamped subscription.
+
+- **The "silently no-ops on a v3.1.1 link" line in README now names its
+  exception.** `WithSubscriptionID` is refused on v3.1.1, not dropped.
+
+- **The consumer list in `CLAUDE.md` named four consumers; there are
+  seven**, each verified against its own `go.mod` on `origin/main`:
+  `openccu-loom`, `go-mtec2mqtt`, `go-zendure2mqtt`,
+  `go-homeconnect2mqtt`, `go-daikin2mqtt`, `go-unifi2mqtt` and
+  `go-hamqtt`. The last is the one the old list could least afford to
+  omit: all six of the others import `go-hamqtt`, so it sits between
+  this module and every other consumer, and a break here can reach a
+  bridge twice — directly and through `go-hamqtt`'s pin.
+
+- **v1.5.1's entry said the dropped-message warning carries the topic.**
+  It does not, as that entry's own next paragraph explains. Corrected in
+  place, dated; the released text is not rewritten.
+
 ## [1.5.1] - 2026-09-12
 
 ### Fixed
@@ -31,6 +78,12 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   invisible — and it is no longer silent: the drop is logged as
   `mqtt.tcp.unstamped_publish_dropped` with the topic and the number of
   stamped subscriptions.
+
+  > **Correction (2026-09-13).** "with the topic" is wrong and
+  > contradicts the very next paragraph of this entry. The warning
+  > carries `stamped_subscriptions` only; the topic is deliberately
+  > absent, for the reason given below. The released entry is kept as
+  > published and corrected here rather than rewritten.
 
   The topic is deliberately not logged. Everything read off the
   connection is, to a static analyser, indistinguishable from the

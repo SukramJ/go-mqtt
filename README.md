@@ -27,6 +27,7 @@ duplicated as `internal/mqtt`.
 | QoS | 0, 1 and 2, both directions, full PUBREC/PUBREL/PUBCOMP handshake |
 | Session resumption | `CleanStart=false` + Session Expiry; unacked QoS>0 state and inbound QoS 2 dedup state replay in order on a resumed session |
 | Flow control | Receive Maximum (v5) / configurable `MaxInflight` (v3.1.1) enforced as a send-quota semaphore; broker Maximum QoS / Retain Available honored locally |
+| Subscription identifiers | `WithSubscriptionID`-stamped v5 subscriptions are attributed by identifier, not re-matched by topic — see [Subscription identifiers](#subscription-identifiers) for the fail-closed trade |
 | Inbound topic aliases | v5 topic alias table resolved per connection (outbound aliasing is out of scope) |
 | Last Will and Testament | v3.1.1 topic/payload/QoS/retain; v5 adds will properties (delay interval, message expiry, content type, correlation data, user properties) |
 | TLS | `NewClientTLSConfig` helper — always sets `ServerName`, never defaults to `InsecureSkipVerify` |
@@ -101,8 +102,13 @@ For a `tls://` broker, set `TCPConfig.TLSConfig` —
 ### MQTT 3.1.1 and v5 properties
 
 Pin `ProtocolV311` for a broker that doesn't speak MQTT 5.0 yet. On a
-v5 link, `PublishOption`/`SubscribeOption` attach protocol properties
-(they are silently no-ops on a v3.1.1 link):
+v5 link, `PublishOption`/`SubscribeOption` attach protocol properties.
+On a v3.1.1 link, which has no property block, they are silently
+no-ops — with one deliberate exception: `WithSubscriptionID` is
+*refused* there rather than dropped, because a caller who believes its
+deliveries are attributable while the client is still re-matching
+topics has the exact failure the option exists to prevent, now
+invisible.
 
 ```go
 client311 := mqtt.NewTCPClient(mqtt.TCPConfig{
@@ -117,6 +123,81 @@ _ = client311.Publish(context.Background(), "bridge/status", []byte("online"),
 	mqtt.WithUserProperties(mqtt.UserProperty{Key: "source", Value: "my-bridge"}),
 )
 ```
+
+## Subscription identifiers
+
+MQTT 5.0 only. `WithSubscriptionID(id)` stamps a Subscription
+Identifier (§3.8.2.1.2) on one `Subscribe` call; the broker then
+includes it on every PUBLISH it forwards for that subscription, and
+`TCPClient` delivers such a message to that subscription alone.
+
+```go
+// Two overlapping filters, each attributable.
+_, _ = client.Subscribe(ctx, "home/+/set", mqtt.QoS1, onCommand,
+	mqtt.WithSubscriptionID(1))
+_, _ = client.Subscribe(ctx, "home/#", mqtt.QoS0, onAudit,
+	mqtt.WithSubscriptionID(2))
+```
+
+**Why it exists.** A broker sends one copy of a PUBLISH *per matching
+subscription* (§3.3.4). A client that decides delivery by re-matching
+each copy's topic against every filter it holds multiplies the two: two
+overlapping filters, two copies, both handlers on each copy — every
+handler runs twice per published message. Measured against Mosquitto
+2.1.2 on both dialects, while tracking down a consumer whose command
+handler performed its write twice with nothing in any log.
+
+**The trade you are accepting.** §3.3.4 requires a server to include
+the identifier of *every* subscription it forwarded a PUBLISH for. So a
+PUBLISH that arrives with **no** identifier was, by the specification,
+forwarded for no stamped subscription, and this client will not
+topic-match it into one: an identifier-less message reaches only
+subscriptions that carry no identifier. The consequence is worth
+stating plainly, because it is the one thing in this module that can
+make a subscription deliver **nothing**:
+
+> Against a broker or intermediary that accepts a Subscription
+> Identifier and then does not stamp what it forwards, a stamped
+> subscription receives nothing at all.
+
+This fails closed on purpose. A doubled command is worse than a dropped
+one, because the doubling is invisible and the drop is not: every such
+message is logged once as
+
+```
+WARN mqtt.tcp.unstamped_publish_dropped stamped_subscriptions=2
+```
+
+That line is the only signal, and it is also the only way to detect the
+non-compliance at all — nothing else in the client can see it. The
+topic is deliberately absent from it: everything read off the
+connection is, to a static analyser, indistinguishable from the
+password this client wrote to the same connection during CONNECT, so
+logging any of it raises a clear-text-logging finding a reader then has
+to re-derive. A consumer that wants the topic has its own handlers to
+log from.
+
+**How to tell whether this applies to you.** Watch for
+`mqtt.tcp.unstamped_publish_dropped` after a subscribe that sets an
+identifier. If it appears, the path between this client and the
+publisher is not stamping: drop the option on that subscription (and
+accept re-matching, with the doubling it implies for overlapping
+filters) or move the deduplication into your handler. If it never
+appears, identifiers are being honoured. Mixing stamped and unstamped
+subscriptions on one client is supported and each is judged on its own:
+an identifier-less message goes only to the unstamped ones, a stamped
+one only to the subscription it names.
+
+**Two further refusals**, each because the silent alternative is worse:
+an identifier the client never registered is dropped rather than
+broadened into a topic match (it names a subscription this process did
+not create — a session resumed from a previous run), and a value
+outside `1..268435455` is refused before the encoder, so the error
+names the value you chose rather than a frame the client did not write.
+
+**On MQTT 3.1.1** the option returns an error. That dialect carries no
+property block, so re-matching is all a v3.1.1 link has, and a client
+that must be correct on both dialects cannot rely on identifiers alone.
 
 ## Circuit breaker
 
