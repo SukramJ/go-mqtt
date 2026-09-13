@@ -30,8 +30,14 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   doubled command is worse than a dropped one, because the doubling is
   invisible — and it is no longer silent: the drop is logged as
   `mqtt.tcp.unstamped_publish_dropped` with the topic and the number of
-  stamped subscriptions, which is the only signature of a
-  non-compliant server the client can produce.
+  stamped subscriptions.
+
+  The topic is deliberately not logged. Everything read off the
+  connection is, to a static analyser, indistinguishable from the
+  password this client wrote to the same connection during CONNECT, so
+  logging any of it raises a clear-text-logging finding a reader then
+  has to re-derive. The count alone still names the condition, and a
+  consumer that wants the topic has its own handlers to log from.
 
 ## [1.5.0] - 2026-09-12
 

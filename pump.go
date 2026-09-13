@@ -515,8 +515,15 @@ func (c *TCPClient) dispatch(msg *Message) {
 		// that accepted a Subscription Identifier and did not stamp the
 		// messages it forwarded — which no compliant server does, and
 		// which nothing else in the client can detect.
+		//
+		// The topic is deliberately NOT logged. Everything read off the
+		// connection is, to a static analyser, indistinguishable from the
+		// password this client wrote to the same connection during
+		// CONNECT, so logging any of it raises a clear-text-logging
+		// finding that a reader then has to re-derive. The count alone
+		// still names the condition, and a consumer that wants the topic
+		// has its own handlers to log from.
 		c.logger.Warn("mqtt.tcp.unstamped_publish_dropped",
-			slog.String("topic", msg.Topic),
 			slog.Int("stamped_subscriptions", stamped))
 	}
 	for _, h := range handlers {
