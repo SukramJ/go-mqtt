@@ -5,8 +5,8 @@ package mqtt
 
 // Unit tests for the Breaker circuit-breaking Publisher decorator
 // (breaker.go): default config, the closed -> open -> half-open -> closed
-// (and half-open -> open) state machine driven by a fake Publisher and a
-// fake clock (cfg.now), the neutral-error classification that must
+// (and half-open -> open) state machine driven by a fake Publisher inside a
+// synctest bubble (virtual time), the neutral-error classification that must
 // neither trip nor reset the failure counter, OnStateChange sequencing
 // and lock-safety, and a concurrency race sweep. The final test drives a
 // real TCPClient against the in-package mockBroker (see
@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/SukramJ/go-mqtt/protocol"
@@ -61,26 +62,19 @@ func (f *fakePublisher) setResults(errs ...error) {
 	f.results = errs
 }
 
-// fakeClock is a manually-advanced clock seam for cfg.now.
-type fakeClock struct {
-	mu  sync.Mutex
-	now time.Time
-}
-
-func newFakeClock() *fakeClock {
-	return &fakeClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}
-}
-
-func (c *fakeClock) Now() time.Time {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.now
-}
-
-func (c *fakeClock) Advance(d time.Duration) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.now = c.now.Add(d)
+// reachRecovery advances the bubble clock to the instant the open circuit
+// admits a probe, pinning both sides of the boundary: one nanosecond before
+// RecoveryTimeout has elapsed the circuit still fails fast, and at the
+// deadline itself (admit rejects only while elapsed < RecoveryTimeout) the
+// next publish is a probe. Fail-fast publishes never reach the wrapped
+// Publisher, so the helper leaves its call count untouched.
+func reachRecovery(t *testing.T, b *Breaker, recovery time.Duration) {
+	t.Helper()
+	time.Sleep(recovery - time.Nanosecond)
+	if err := publishOnce(t, b); !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("publish 1ns before RecoveryTimeout err = %v, want ErrCircuitOpen", err)
+	}
+	time.Sleep(time.Nanosecond)
 }
 
 // publishOnce calls Publish with a background context and no payload
@@ -104,9 +98,6 @@ func TestNewBreakerAppliesDefaults(t *testing.T) {
 	}
 	if b.cfg.HalfOpenMax != 1 {
 		t.Fatalf("HalfOpenMax = %d, want 1", b.cfg.HalfOpenMax)
-	}
-	if b.cfg.now == nil {
-		t.Fatal("now = nil, want time.Now fallback")
 	}
 	if got := b.State(); got != BreakerClosed {
 		t.Fatalf("initial State() = %v, want closed", got)
@@ -132,45 +123,46 @@ func TestNewBreakerRejectsNegativeConfigTheSameAsZero(t *testing.T) {
 func TestClosedOpensAfterExactlyThresholdConsecutiveFailures(t *testing.T) {
 	t.Parallel()
 
-	fp := &fakePublisher{}
-	clk := newFakeClock()
-	b := NewBreaker(fp, BreakerConfig{FailureThreshold: 3, now: clk.Now})
+	synctest.Test(t, func(t *testing.T) {
+		fp := &fakePublisher{}
+		b := NewBreaker(fp, BreakerConfig{FailureThreshold: 3})
 
-	fp.setResults(errAckTimeout)
-	for i := 1; i < 3; i++ {
-		if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
-			t.Fatalf("publish %d err = %v, want errAckTimeout", i, err)
+		fp.setResults(errAckTimeout)
+		for i := 1; i < 3; i++ {
+			if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
+				t.Fatalf("publish %d err = %v, want errAckTimeout", i, err)
+			}
+			if got := b.State(); got != BreakerClosed {
+				t.Fatalf("after %d/3 failures State() = %v, want closed", i, got)
+			}
+		}
+
+		// A success before the threshold is reached resets the streak.
+		fp.setResults(nil)
+		if err := publishOnce(t, b); err != nil {
+			t.Fatalf("reset publish: %v", err)
 		}
 		if got := b.State(); got != BreakerClosed {
-			t.Fatalf("after %d/3 failures State() = %v, want closed", i, got)
+			t.Fatalf("State() after reset success = %v, want closed", got)
 		}
-	}
 
-	// A success before the threshold is reached resets the streak.
-	fp.setResults(nil)
-	if err := publishOnce(t, b); err != nil {
-		t.Fatalf("reset publish: %v", err)
-	}
-	if got := b.State(); got != BreakerClosed {
-		t.Fatalf("State() after reset success = %v, want closed", got)
-	}
-
-	fp.setResults(errAckTimeout)
-	for i := 1; i < 3; i++ {
+		fp.setResults(errAckTimeout)
+		for i := 1; i < 3; i++ {
+			if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
+				t.Fatalf("post-reset publish %d err = %v, want errAckTimeout", i, err)
+			}
+			if got := b.State(); got != BreakerClosed {
+				t.Fatalf("post-reset after %d/3 failures State() = %v, want closed", i, got)
+			}
+		}
+		// Third consecutive countable failure trips the breaker.
 		if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
-			t.Fatalf("post-reset publish %d err = %v, want errAckTimeout", i, err)
+			t.Fatalf("tripping publish err = %v, want errAckTimeout", err)
 		}
-		if got := b.State(); got != BreakerClosed {
-			t.Fatalf("post-reset after %d/3 failures State() = %v, want closed", i, got)
+		if got := b.State(); got != BreakerOpen {
+			t.Fatalf("State() after threshold failures = %v, want open", got)
 		}
-	}
-	// Third consecutive countable failure trips the breaker.
-	if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
-		t.Fatalf("tripping publish err = %v, want errAckTimeout", err)
-	}
-	if got := b.State(); got != BreakerOpen {
-		t.Fatalf("State() after threshold failures = %v, want open", got)
-	}
+	})
 }
 
 // TestOpenFailsFastWithoutCallingWrappedPublisher proves an open circuit
@@ -179,27 +171,28 @@ func TestClosedOpensAfterExactlyThresholdConsecutiveFailures(t *testing.T) {
 func TestOpenFailsFastWithoutCallingWrappedPublisher(t *testing.T) {
 	t.Parallel()
 
-	fp := &fakePublisher{}
-	clk := newFakeClock()
-	b := NewBreaker(fp, BreakerConfig{FailureThreshold: 1, RecoveryTimeout: time.Minute, now: clk.Now})
+	synctest.Test(t, func(t *testing.T) {
+		fp := &fakePublisher{}
+		b := NewBreaker(fp, BreakerConfig{FailureThreshold: 1, RecoveryTimeout: time.Minute})
 
-	fp.setResults(errAckTimeout)
-	if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
-		t.Fatalf("tripping publish err = %v, want errAckTimeout", err)
-	}
-	if got := b.State(); got != BreakerOpen {
-		t.Fatalf("State() = %v, want open", got)
-	}
-	before := fp.callCount()
-
-	for i := range 3 {
-		if err := publishOnce(t, b); !errors.Is(err, ErrCircuitOpen) {
-			t.Fatalf("publish %d while open err = %v, want ErrCircuitOpen", i, err)
+		fp.setResults(errAckTimeout)
+		if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
+			t.Fatalf("tripping publish err = %v, want errAckTimeout", err)
 		}
-	}
-	if after := fp.callCount(); after != before {
-		t.Fatalf("wrapped Publisher call count = %d, want unchanged at %d while open", after, before)
-	}
+		if got := b.State(); got != BreakerOpen {
+			t.Fatalf("State() = %v, want open", got)
+		}
+		before := fp.callCount()
+
+		for i := range 3 {
+			if err := publishOnce(t, b); !errors.Is(err, ErrCircuitOpen) {
+				t.Fatalf("publish %d while open err = %v, want ErrCircuitOpen", i, err)
+			}
+		}
+		if after := fp.callCount(); after != before {
+			t.Fatalf("wrapped Publisher call count = %d, want unchanged at %d while open", after, before)
+		}
+	})
 }
 
 // TestOpenAdmitsExactlyOneProbeAfterRecoveryTimeout proves that once the
@@ -209,58 +202,59 @@ func TestOpenFailsFastWithoutCallingWrappedPublisher(t *testing.T) {
 func TestOpenAdmitsExactlyOneProbeAfterRecoveryTimeout(t *testing.T) {
 	t.Parallel()
 
-	fp := &fakePublisher{}
-	clk := newFakeClock()
-	b := NewBreaker(fp, BreakerConfig{FailureThreshold: 1, RecoveryTimeout: 10 * time.Second, HalfOpenMax: 1, now: clk.Now})
+	synctest.Test(t, func(t *testing.T) {
+		fp := &fakePublisher{}
+		b := NewBreaker(fp, BreakerConfig{FailureThreshold: 1, RecoveryTimeout: 10 * time.Second, HalfOpenMax: 1})
 
-	fp.setResults(errAckTimeout)
-	if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
-		t.Fatalf("tripping publish err = %v, want errAckTimeout", err)
-	}
-	if got := b.State(); got != BreakerOpen {
-		t.Fatalf("State() = %v, want open", got)
-	}
+		fp.setResults(errAckTimeout)
+		if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
+			t.Fatalf("tripping publish err = %v, want errAckTimeout", err)
+		}
+		if got := b.State(); got != BreakerOpen {
+			t.Fatalf("State() = %v, want open", got)
+		}
 
-	// Not yet past RecoveryTimeout: still fails fast.
-	if err := publishOnce(t, b); !errors.Is(err, ErrCircuitOpen) {
-		t.Fatalf("publish before RecoveryTimeout err = %v, want ErrCircuitOpen", err)
-	}
+		// Not yet past RecoveryTimeout: still fails fast.
+		if err := publishOnce(t, b); !errors.Is(err, ErrCircuitOpen) {
+			t.Fatalf("publish before RecoveryTimeout err = %v, want ErrCircuitOpen", err)
+		}
 
-	clk.Advance(10*time.Second + time.Millisecond)
+		reachRecovery(t, b, 10*time.Second)
 
-	// Block the admitted probe inside the wrapped Publisher so a second,
-	// genuinely concurrent publish is guaranteed to observe the
-	// half-open state with its single slot already taken.
-	release := make(chan struct{})
-	entered := make(chan struct{})
-	blocking := &blockingPublisher{enter: entered, release: release}
-	b2 := NewBreaker(blocking, BreakerConfig{FailureThreshold: 1, RecoveryTimeout: 10 * time.Second, HalfOpenMax: 1, now: clk.Now})
-	b2.mu.Lock()
-	b2.state = BreakerOpen
-	b2.openedAt = clk.Now().Add(-11 * time.Second)
-	b2.mu.Unlock()
+		// Block the admitted probe inside the wrapped Publisher so a second,
+		// genuinely concurrent publish is guaranteed to observe the
+		// half-open state with its single slot already taken.
+		release := make(chan struct{})
+		entered := make(chan struct{})
+		blocking := &blockingPublisher{enter: entered, release: release}
+		b2 := NewBreaker(blocking, BreakerConfig{FailureThreshold: 1, RecoveryTimeout: 10 * time.Second, HalfOpenMax: 1})
+		b2.mu.Lock()
+		b2.state = BreakerOpen
+		b2.openedAt = time.Now().Add(-11 * time.Second)
+		b2.mu.Unlock()
 
-	probeErrCh := make(chan error, 1)
-	go func() { probeErrCh <- publishOnce(t, b2) }()
+		probeErrCh := make(chan error, 1)
+		go func() { probeErrCh <- publishOnce(t, b2) }()
 
-	select {
-	case <-entered:
-	case <-time.After(2 * time.Second):
-		t.Fatal("probe never reached the wrapped Publisher")
-	}
-	if got := b2.State(); got != BreakerHalfOpen {
-		t.Fatalf("State() while probe in flight = %v, want half-open", got)
-	}
+		select {
+		case <-entered:
+		case <-time.After(2 * time.Second):
+			t.Fatal("probe never reached the wrapped Publisher")
+		}
+		if got := b2.State(); got != BreakerHalfOpen {
+			t.Fatalf("State() while probe in flight = %v, want half-open", got)
+		}
 
-	// Second publish while the sole slot is occupied must fail fast.
-	if err := publishOnce(t, b2); !errors.Is(err, ErrCircuitOpen) {
-		t.Fatalf("concurrent publish err = %v, want ErrCircuitOpen", err)
-	}
+		// Second publish while the sole slot is occupied must fail fast.
+		if err := publishOnce(t, b2); !errors.Is(err, ErrCircuitOpen) {
+			t.Fatalf("concurrent publish err = %v, want ErrCircuitOpen", err)
+		}
 
-	close(release)
-	if err := <-probeErrCh; err != nil {
-		t.Fatalf("probe publish err = %v, want nil", err)
-	}
+		close(release)
+		if err := <-probeErrCh; err != nil {
+			t.Fatalf("probe publish err = %v, want nil", err)
+		}
+	})
 }
 
 // blockingPublisher signals entered once Publish is called and then
@@ -283,32 +277,33 @@ func (p *blockingPublisher) Publish(ctx context.Context, topic string, payload [
 func TestHalfOpenProbeSuccessCloses(t *testing.T) {
 	t.Parallel()
 
-	fp := &fakePublisher{}
-	clk := newFakeClock()
-	b := NewBreaker(fp, BreakerConfig{FailureThreshold: 1, RecoveryTimeout: time.Second, now: clk.Now})
+	synctest.Test(t, func(t *testing.T) {
+		fp := &fakePublisher{}
+		b := NewBreaker(fp, BreakerConfig{FailureThreshold: 1, RecoveryTimeout: time.Second})
 
-	fp.setResults(errAckTimeout)
-	if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
-		t.Fatalf("tripping publish err = %v, want errAckTimeout", err)
-	}
+		fp.setResults(errAckTimeout)
+		if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
+			t.Fatalf("tripping publish err = %v, want errAckTimeout", err)
+		}
 
-	clk.Advance(time.Second + time.Millisecond)
-	fp.setResults(nil)
-	if err := publishOnce(t, b); err != nil {
-		t.Fatalf("probe publish err = %v, want nil", err)
-	}
-	if got := b.State(); got != BreakerClosed {
-		t.Fatalf("State() after successful probe = %v, want closed", got)
-	}
+		reachRecovery(t, b, time.Second)
+		fp.setResults(nil)
+		if err := publishOnce(t, b); err != nil {
+			t.Fatalf("probe publish err = %v, want nil", err)
+		}
+		if got := b.State(); got != BreakerClosed {
+			t.Fatalf("State() after successful probe = %v, want closed", got)
+		}
 
-	// A fresh failure streak from closed needs the full threshold again.
-	fp.setResults(errAckTimeout)
-	if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
-		t.Fatalf("post-close publish err = %v, want errAckTimeout", err)
-	}
-	if got := b.State(); got != BreakerOpen {
-		t.Fatalf("State() = %v, want open (threshold 1)", got)
-	}
+		// A fresh failure streak from closed needs the full threshold again.
+		fp.setResults(errAckTimeout)
+		if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
+			t.Fatalf("post-close publish err = %v, want errAckTimeout", err)
+		}
+		if got := b.State(); got != BreakerOpen {
+			t.Fatalf("State() = %v, want open (threshold 1)", got)
+		}
+	})
 }
 
 // TestHalfOpenProbeFailureReopensWithFreshWindow proves a failed probe
@@ -317,47 +312,44 @@ func TestHalfOpenProbeSuccessCloses(t *testing.T) {
 func TestHalfOpenProbeFailureReopensWithFreshWindow(t *testing.T) {
 	t.Parallel()
 
-	fp := &fakePublisher{}
-	clk := newFakeClock()
-	b := NewBreaker(fp, BreakerConfig{FailureThreshold: 1, RecoveryTimeout: 10 * time.Second, now: clk.Now})
+	synctest.Test(t, func(t *testing.T) {
+		fp := &fakePublisher{}
+		b := NewBreaker(fp, BreakerConfig{FailureThreshold: 1, RecoveryTimeout: 10 * time.Second})
 
-	fp.setResults(errAckTimeout)
-	if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
-		t.Fatalf("tripping publish err = %v, want errAckTimeout", err)
-	}
+		fp.setResults(errAckTimeout)
+		if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
+			t.Fatalf("tripping publish err = %v, want errAckTimeout", err)
+		}
 
-	clk.Advance(10*time.Second + time.Millisecond)
-	fp.setResults(errAckTimeout)
-	if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
-		t.Fatalf("failed probe err = %v, want errAckTimeout", err)
-	}
-	if got := b.State(); got != BreakerOpen {
-		t.Fatalf("State() after failed probe = %v, want open", got)
-	}
+		reachRecovery(t, b, 10*time.Second)
+		fp.setResults(errAckTimeout)
+		if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
+			t.Fatalf("failed probe err = %v, want errAckTimeout", err)
+		}
+		if got := b.State(); got != BreakerOpen {
+			t.Fatalf("State() after failed probe = %v, want open", got)
+		}
 
-	// Immediately after re-opening, still within the fresh window: fails
-	// fast rather than probing again.
-	if err := publishOnce(t, b); !errors.Is(err, ErrCircuitOpen) {
-		t.Fatalf("publish right after re-open err = %v, want ErrCircuitOpen", err)
-	}
+		// Immediately after re-opening, still within the fresh window: fails
+		// fast rather than probing again.
+		if err := publishOnce(t, b); !errors.Is(err, ErrCircuitOpen) {
+			t.Fatalf("publish right after re-open err = %v, want ErrCircuitOpen", err)
+		}
 
-	// Advancing only up to (not past) the original trip-plus-timeout mark
-	// must still fail fast: the window restarted at the failed-probe
-	// time, ~10s+1ms after the original trip.
-	clk.Advance(9 * time.Second)
-	if err := publishOnce(t, b); !errors.Is(err, ErrCircuitOpen) {
-		t.Fatalf("publish before the fresh window elapses err = %v, want ErrCircuitOpen", err)
-	}
-
-	// Advance past the fresh window: a new probe is admitted.
-	clk.Advance(2 * time.Second)
-	fp.setResults(nil)
-	if err := publishOnce(t, b); err != nil {
-		t.Fatalf("probe after fresh window err = %v, want nil", err)
-	}
-	if got := b.State(); got != BreakerClosed {
-		t.Fatalf("State() after successful second probe = %v, want closed", got)
-	}
+		// The window restarted at the failed-probe instant, so it is the
+		// failed probe's own 10s that counts, not the original trip's: the
+		// helper pins 1ns before the deadline (still open) and the
+		// deadline itself (admitted).
+		reachRecovery(t, b, 10*time.Second)
+		// At the fresh window's deadline a new probe is admitted.
+		fp.setResults(nil)
+		if err := publishOnce(t, b); err != nil {
+			t.Fatalf("probe after fresh window err = %v, want nil", err)
+		}
+		if got := b.State(); got != BreakerClosed {
+			t.Fatalf("State() after successful second probe = %v, want closed", got)
+		}
+	})
 }
 
 // TestNeutralErrorsDoNotTripOrResetFailureCounter proves
@@ -370,52 +362,53 @@ func TestHalfOpenProbeFailureReopensWithFreshWindow(t *testing.T) {
 func TestNeutralErrorsDoNotTripOrResetFailureCounter(t *testing.T) {
 	t.Parallel()
 
-	fp := &fakePublisher{}
-	clk := newFakeClock()
-	b := NewBreaker(fp, BreakerConfig{FailureThreshold: 5, now: clk.Now})
+	synctest.Test(t, func(t *testing.T) {
+		fp := &fakePublisher{}
+		b := NewBreaker(fp, BreakerConfig{FailureThreshold: 5})
 
-	fp.setResults(errAckTimeout)
-	for i := 1; i <= 2; i++ {
-		if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
-			t.Fatalf("countable failure %d err = %v, want errAckTimeout", i, err)
+		fp.setResults(errAckTimeout)
+		for i := 1; i <= 2; i++ {
+			if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
+				t.Fatalf("countable failure %d err = %v, want errAckTimeout", i, err)
+			}
 		}
-	}
 
-	cancelledCtx, cancel := context.WithCancel(context.Background())
-	cancel()
-	for _, neutral := range []error{ErrPacketTooLarge, ErrPacketIDExhausted, cancelledCtx.Err()} {
-		fp.setResults(neutral)
-		if err := b.Publish(cancelledCtxOrBackground(cancelledCtx, neutral), "t/topic", []byte("x"), QoS1, false); !errors.Is(err, neutral) {
-			t.Fatalf("neutral publish err = %v, want %v", err, neutral)
+		cancelledCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+		for _, neutral := range []error{ErrPacketTooLarge, ErrPacketIDExhausted, cancelledCtx.Err()} {
+			fp.setResults(neutral)
+			if err := b.Publish(cancelledCtxOrBackground(cancelledCtx, neutral), "t/topic", []byte("x"), QoS1, false); !errors.Is(err, neutral) {
+				t.Fatalf("neutral publish err = %v, want %v", err, neutral)
+			}
+			if got := b.State(); got != BreakerClosed {
+				t.Fatalf("State() after neutral error %v = %v, want closed", neutral, got)
+			}
+		}
+
+		// Three more countable failures: total countable failures logged is
+		// 2 + 3 = 5, hitting the threshold on the fifth (the neutral error in
+		// between must not have reset the streak back to zero, nor must it
+		// have silently counted toward the threshold on its own).
+		fp.setResults(errAckTimeout)
+		if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
+			t.Fatalf("countable failure 3 err = %v, want errAckTimeout", err)
 		}
 		if got := b.State(); got != BreakerClosed {
-			t.Fatalf("State() after neutral error %v = %v, want closed", neutral, got)
+			t.Fatalf("State() after 3rd countable failure = %v, want closed", got)
 		}
-	}
-
-	// Three more countable failures: total countable failures logged is
-	// 2 + 3 = 5, hitting the threshold on the fifth (the neutral error in
-	// between must not have reset the streak back to zero, nor must it
-	// have silently counted toward the threshold on its own).
-	fp.setResults(errAckTimeout)
-	if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
-		t.Fatalf("countable failure 3 err = %v, want errAckTimeout", err)
-	}
-	if got := b.State(); got != BreakerClosed {
-		t.Fatalf("State() after 3rd countable failure = %v, want closed", got)
-	}
-	if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
-		t.Fatalf("countable failure 4 err = %v, want errAckTimeout", err)
-	}
-	if got := b.State(); got != BreakerClosed {
-		t.Fatalf("State() after 4th countable failure = %v, want closed", got)
-	}
-	if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
-		t.Fatalf("countable failure 5 err = %v, want errAckTimeout", err)
-	}
-	if got := b.State(); got != BreakerOpen {
-		t.Fatalf("State() after 5th countable failure = %v, want open (neutral error must not have reset the streak)", got)
-	}
+		if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
+			t.Fatalf("countable failure 4 err = %v, want errAckTimeout", err)
+		}
+		if got := b.State(); got != BreakerClosed {
+			t.Fatalf("State() after 4th countable failure = %v, want closed", got)
+		}
+		if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
+			t.Fatalf("countable failure 5 err = %v, want errAckTimeout", err)
+		}
+		if got := b.State(); got != BreakerOpen {
+			t.Fatalf("State() after 5th countable failure = %v, want open (neutral error must not have reset the streak)", got)
+		}
+	})
 }
 
 // cancelledCtxOrBackground returns ctx when the failure under test is the
@@ -437,32 +430,33 @@ func cancelledCtxOrBackground(ctx context.Context, err error) context.Context {
 func TestNeutralErrorDuringHalfOpenReleasesProbeSlot(t *testing.T) {
 	t.Parallel()
 
-	fp := &fakePublisher{}
-	clk := newFakeClock()
-	b := NewBreaker(fp, BreakerConfig{FailureThreshold: 1, RecoveryTimeout: time.Second, HalfOpenMax: 1, now: clk.Now})
+	synctest.Test(t, func(t *testing.T) {
+		fp := &fakePublisher{}
+		b := NewBreaker(fp, BreakerConfig{FailureThreshold: 1, RecoveryTimeout: time.Second, HalfOpenMax: 1})
 
-	fp.setResults(errAckTimeout)
-	if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
-		t.Fatalf("tripping publish err = %v, want errAckTimeout", err)
-	}
-	clk.Advance(time.Second + time.Millisecond)
+		fp.setResults(errAckTimeout)
+		if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
+			t.Fatalf("tripping publish err = %v, want errAckTimeout", err)
+		}
+		reachRecovery(t, b, time.Second)
 
-	fp.setResults(ErrPacketTooLarge)
-	if err := publishOnce(t, b); !errors.Is(err, ErrPacketTooLarge) {
-		t.Fatalf("neutral probe err = %v, want ErrPacketTooLarge", err)
-	}
-	if got := b.State(); got != BreakerHalfOpen {
-		t.Fatalf("State() after neutral probe = %v, want half-open", got)
-	}
+		fp.setResults(ErrPacketTooLarge)
+		if err := publishOnce(t, b); !errors.Is(err, ErrPacketTooLarge) {
+			t.Fatalf("neutral probe err = %v, want ErrPacketTooLarge", err)
+		}
+		if got := b.State(); got != BreakerHalfOpen {
+			t.Fatalf("State() after neutral probe = %v, want half-open", got)
+		}
 
-	// No clock advance: the slot must already be free again.
-	fp.setResults(nil)
-	if err := publishOnce(t, b); err != nil {
-		t.Fatalf("second probe err = %v, want nil", err)
-	}
-	if got := b.State(); got != BreakerClosed {
-		t.Fatalf("State() after successful second probe = %v, want closed", got)
-	}
+		// No clock advance: the slot must already be free again.
+		fp.setResults(nil)
+		if err := publishOnce(t, b); err != nil {
+			t.Fatalf("second probe err = %v, want nil", err)
+		}
+		if got := b.State(); got != BreakerClosed {
+			t.Fatalf("State() after successful second probe = %v, want closed", got)
+		}
+	})
 }
 
 // TestReasonErrorWithErrorCodeCountsWithoutErrorCodeDoesNot proves the
@@ -471,33 +465,34 @@ func TestNeutralErrorDuringHalfOpenReleasesProbeSlot(t *testing.T) {
 func TestReasonErrorWithErrorCodeCountsWithoutErrorCodeDoesNot(t *testing.T) {
 	t.Parallel()
 
-	fp := &fakePublisher{}
-	clk := newFakeClock()
-	b := NewBreaker(fp, BreakerConfig{FailureThreshold: 1, now: clk.Now})
+	synctest.Test(t, func(t *testing.T) {
+		fp := &fakePublisher{}
+		b := NewBreaker(fp, BreakerConfig{FailureThreshold: 1})
 
-	// GrantedQoS1 (0x01) is not an error code.
-	grantedQoS1 := &ReasonError{Packet: "SUBSCRIBE", Code: protocol.GrantedQoS1}
-	if grantedQoS1.Code.IsError() {
-		t.Fatal("fixture sanity check failed: GrantedQoS1 must not be an error code")
-	}
-	fp.setResults(grantedQoS1)
-	if err := publishOnce(t, b); !errors.Is(err, error(grantedQoS1)) {
-		t.Fatalf("publish err = %v, want the ReasonError instance back unwrapped", err)
-	}
-	if got := b.State(); got != BreakerClosed {
-		t.Fatalf("State() after non-error ReasonCode = %v, want closed (neutral)", got)
-	}
+		// GrantedQoS1 (0x01) is not an error code.
+		grantedQoS1 := &ReasonError{Packet: "SUBSCRIBE", Code: protocol.GrantedQoS1}
+		if grantedQoS1.Code.IsError() {
+			t.Fatal("fixture sanity check failed: GrantedQoS1 must not be an error code")
+		}
+		fp.setResults(grantedQoS1)
+		if err := publishOnce(t, b); !errors.Is(err, error(grantedQoS1)) {
+			t.Fatalf("publish err = %v, want the ReasonError instance back unwrapped", err)
+		}
+		if got := b.State(); got != BreakerClosed {
+			t.Fatalf("State() after non-error ReasonCode = %v, want closed (neutral)", got)
+		}
 
-	// QuotaExceeded (0x97) is an error code: counts, and with
-	// FailureThreshold 1 trips immediately.
-	quotaExceeded := &ReasonError{Packet: "PUBLISH", Code: protocol.QuotaExceeded}
-	fp.setResults(quotaExceeded)
-	if err := publishOnce(t, b); !errors.Is(err, error(quotaExceeded)) {
-		t.Fatalf("publish err = %v, want the ReasonError instance back", err)
-	}
-	if got := b.State(); got != BreakerOpen {
-		t.Fatalf("State() after error ReasonCode = %v, want open", got)
-	}
+		// QuotaExceeded (0x97) is an error code: counts, and with
+		// FailureThreshold 1 trips immediately.
+		quotaExceeded := &ReasonError{Packet: "PUBLISH", Code: protocol.QuotaExceeded}
+		fp.setResults(quotaExceeded)
+		if err := publishOnce(t, b); !errors.Is(err, error(quotaExceeded)) {
+			t.Fatalf("publish err = %v, want the ReasonError instance back", err)
+		}
+		if got := b.State(); got != BreakerOpen {
+			t.Fatalf("State() after error ReasonCode = %v, want open", got)
+		}
+	})
 }
 
 // TestUnknownErrorCountsAsFailure proves an arbitrary error that matches
@@ -508,18 +503,19 @@ func TestReasonErrorWithErrorCodeCountsWithoutErrorCodeDoesNot(t *testing.T) {
 func TestUnknownErrorCountsAsFailure(t *testing.T) {
 	t.Parallel()
 
-	fp := &fakePublisher{}
-	clk := newFakeClock()
-	b := NewBreaker(fp, BreakerConfig{FailureThreshold: 1, now: clk.Now})
+	synctest.Test(t, func(t *testing.T) {
+		fp := &fakePublisher{}
+		b := NewBreaker(fp, BreakerConfig{FailureThreshold: 1})
 
-	unknown := errors.New("boom: some unclassified transport error")
-	fp.setResults(unknown)
-	if err := publishOnce(t, b); !errors.Is(err, unknown) {
-		t.Fatalf("publish err = %v, want the unknown error back unwrapped", err)
-	}
-	if got := b.State(); got != BreakerOpen {
-		t.Fatalf("State() after an unclassified error = %v, want open (unknown errors must count)", got)
-	}
+		unknown := errors.New("boom: some unclassified transport error")
+		fp.setResults(unknown)
+		if err := publishOnce(t, b); !errors.Is(err, unknown) {
+			t.Fatalf("publish err = %v, want the unknown error back unwrapped", err)
+		}
+		if got := b.State(); got != BreakerOpen {
+			t.Fatalf("State() after an unclassified error = %v, want open (unknown errors must count)", got)
+		}
+	})
 }
 
 // TestOnStateChangeSequenceClosedOpenHalfOpenClosed proves the exact
@@ -530,51 +526,51 @@ func TestUnknownErrorCountsAsFailure(t *testing.T) {
 func TestOnStateChangeSequenceClosedOpenHalfOpenClosed(t *testing.T) {
 	t.Parallel()
 
-	type transition struct{ from, to BreakerState }
-	var mu sync.Mutex
-	var got []transition
+	synctest.Test(t, func(t *testing.T) {
+		type transition struct{ from, to BreakerState }
+		var mu sync.Mutex
+		var got []transition
 
-	fp := &fakePublisher{}
-	clk := newFakeClock()
-	var b *Breaker
-	b = NewBreaker(fp, BreakerConfig{
-		FailureThreshold: 1,
-		RecoveryTimeout:  time.Second,
-		now:              clk.Now,
-		OnStateChange: func(from, to BreakerState) {
-			mu.Lock()
-			got = append(got, transition{from, to})
-			mu.Unlock()
-			// Must not deadlock: the callback runs outside the lock.
-			_ = b.State()
-		},
-	})
+		fp := &fakePublisher{}
+		var b *Breaker
+		b = NewBreaker(fp, BreakerConfig{
+			FailureThreshold: 1,
+			RecoveryTimeout:  time.Second,
+			OnStateChange: func(from, to BreakerState) {
+				mu.Lock()
+				got = append(got, transition{from, to})
+				mu.Unlock()
+				// Must not deadlock: the callback runs outside the lock.
+				_ = b.State()
+			},
+		})
 
-	fp.setResults(errAckTimeout)
-	if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
-		t.Fatalf("tripping publish err = %v, want errAckTimeout", err)
-	}
-	clk.Advance(time.Second + time.Millisecond)
-	fp.setResults(nil)
-	if err := publishOnce(t, b); err != nil {
-		t.Fatalf("probe publish err = %v, want nil", err)
-	}
-
-	want := []transition{
-		{BreakerClosed, BreakerOpen},
-		{BreakerOpen, BreakerHalfOpen},
-		{BreakerHalfOpen, BreakerClosed},
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(got) != len(want) {
-		t.Fatalf("transitions = %+v, want %+v", got, want)
-	}
-	for i, w := range want {
-		if got[i] != w {
-			t.Fatalf("transition %d = %+v, want %+v (full sequence: %+v)", i, got[i], w, got)
+		fp.setResults(errAckTimeout)
+		if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
+			t.Fatalf("tripping publish err = %v, want errAckTimeout", err)
 		}
-	}
+		reachRecovery(t, b, time.Second)
+		fp.setResults(nil)
+		if err := publishOnce(t, b); err != nil {
+			t.Fatalf("probe publish err = %v, want nil", err)
+		}
+
+		want := []transition{
+			{BreakerClosed, BreakerOpen},
+			{BreakerOpen, BreakerHalfOpen},
+			{BreakerHalfOpen, BreakerClosed},
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(got) != len(want) {
+			t.Fatalf("transitions = %+v, want %+v", got, want)
+		}
+		for i, w := range want {
+			if got[i] != w {
+				t.Fatalf("transition %d = %+v, want %+v (full sequence: %+v)", i, got[i], w, got)
+			}
+		}
+	})
 }
 
 // TestOnStateChangeSequenceClosedOpenHalfOpenOpen proves the failed-probe
@@ -582,50 +578,50 @@ func TestOnStateChangeSequenceClosedOpenHalfOpenClosed(t *testing.T) {
 func TestOnStateChangeSequenceClosedOpenHalfOpenOpen(t *testing.T) {
 	t.Parallel()
 
-	type transition struct{ from, to BreakerState }
-	var mu sync.Mutex
-	var got []transition
+	synctest.Test(t, func(t *testing.T) {
+		type transition struct{ from, to BreakerState }
+		var mu sync.Mutex
+		var got []transition
 
-	fp := &fakePublisher{}
-	clk := newFakeClock()
-	var b *Breaker
-	b = NewBreaker(fp, BreakerConfig{
-		FailureThreshold: 1,
-		RecoveryTimeout:  time.Second,
-		now:              clk.Now,
-		OnStateChange: func(from, to BreakerState) {
-			mu.Lock()
-			got = append(got, transition{from, to})
-			mu.Unlock()
-			_ = b.State()
-		},
-	})
+		fp := &fakePublisher{}
+		var b *Breaker
+		b = NewBreaker(fp, BreakerConfig{
+			FailureThreshold: 1,
+			RecoveryTimeout:  time.Second,
+			OnStateChange: func(from, to BreakerState) {
+				mu.Lock()
+				got = append(got, transition{from, to})
+				mu.Unlock()
+				_ = b.State()
+			},
+		})
 
-	fp.setResults(errAckTimeout)
-	if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
-		t.Fatalf("tripping publish err = %v, want errAckTimeout", err)
-	}
-	clk.Advance(time.Second + time.Millisecond)
-	fp.setResults(errAckTimeout)
-	if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
-		t.Fatalf("failed probe err = %v, want errAckTimeout", err)
-	}
-
-	want := []transition{
-		{BreakerClosed, BreakerOpen},
-		{BreakerOpen, BreakerHalfOpen},
-		{BreakerHalfOpen, BreakerOpen},
-	}
-	mu.Lock()
-	defer mu.Unlock()
-	if len(got) != len(want) {
-		t.Fatalf("transitions = %+v, want %+v", got, want)
-	}
-	for i, w := range want {
-		if got[i] != w {
-			t.Fatalf("transition %d = %+v, want %+v (full sequence: %+v)", i, got[i], w, got)
+		fp.setResults(errAckTimeout)
+		if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
+			t.Fatalf("tripping publish err = %v, want errAckTimeout", err)
 		}
-	}
+		reachRecovery(t, b, time.Second)
+		fp.setResults(errAckTimeout)
+		if err := publishOnce(t, b); !errors.Is(err, errAckTimeout) {
+			t.Fatalf("failed probe err = %v, want errAckTimeout", err)
+		}
+
+		want := []transition{
+			{BreakerClosed, BreakerOpen},
+			{BreakerOpen, BreakerHalfOpen},
+			{BreakerHalfOpen, BreakerOpen},
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(got) != len(want) {
+			t.Fatalf("transitions = %+v, want %+v", got, want)
+		}
+		for i, w := range want {
+			if got[i] != w {
+				t.Fatalf("transition %d = %+v, want %+v (full sequence: %+v)", i, got[i], w, got)
+			}
+		}
+	})
 }
 
 // TestBreakerConcurrentPublishNoRace hammers Publish from many goroutines
