@@ -158,13 +158,11 @@ func TestV5ReceiveMaximumBurst(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make([]error, burst)
 	for i := range burst {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
 			errs[i] = c.Publish(ctx, topic, fmt.Appendf(nil, "burst-%d", i), mqtt.QoS1, false)
-		}()
+		})
 	}
 	wg.Wait()
 

@@ -11,10 +11,6 @@ import (
 	"testing"
 )
 
-func bptr(b byte) *byte       { return &b }
-func u16ptr(v uint16) *uint16 { return &v }
-func u32ptr(v uint32) *uint32 { return &v }
-
 // allTargets is every context in which a property block can appear: each
 // property-carrying control packet plus the CONNECT will block. The
 // spec-driven tests iterate this to decide, per property, which contexts
@@ -44,33 +40,33 @@ var allTargets = []struct {
 // representative, non-zero value. The spec-driven round-trip test uses it
 // as both the encode input and the expected decode output.
 var propFixtures = map[byte]*Properties{
-	0x01: {PayloadFormat: bptr(1)},
-	0x02: {MessageExpiryInterval: u32ptr(3600)},
+	0x01: {PayloadFormat: new(byte(1))},
+	0x02: {MessageExpiryInterval: new(uint32(3600))},
 	0x03: {ContentType: "application/json"},
 	0x08: {ResponseTopic: "resp/topic"},
 	0x09: {CorrelationData: []byte{0x01, 0x02, 0x03, 0x04}},
 	0x0B: {SubscriptionIdentifiers: []uint32{5}},
-	0x11: {SessionExpiryInterval: u32ptr(120)},
+	0x11: {SessionExpiryInterval: new(uint32(120))},
 	0x12: {AssignedClientID: "assigned-id"},
-	0x13: {ServerKeepAlive: u16ptr(30)},
+	0x13: {ServerKeepAlive: new(uint16(30))},
 	0x15: {AuthMethod: "SCRAM-SHA-1"},
 	0x16: {AuthData: []byte{0xAA, 0xBB}},
-	0x17: {RequestProblemInfo: bptr(1)},
-	0x18: {WillDelayInterval: u32ptr(10)},
-	0x19: {RequestResponseInfo: bptr(1)},
+	0x17: {RequestProblemInfo: new(byte(1))},
+	0x18: {WillDelayInterval: new(uint32(10))},
+	0x19: {RequestResponseInfo: new(byte(1))},
 	0x1A: {ResponseInfo: "response-info"},
 	0x1C: {ServerReference: "other-server:1883"},
 	0x1F: {ReasonString: "because"},
-	0x21: {ReceiveMaximum: u16ptr(100)},
-	0x22: {TopicAliasMaximum: u16ptr(10)},
-	0x23: {TopicAlias: u16ptr(7)},
-	0x24: {MaximumQoS: bptr(1)},
-	0x25: {RetainAvailable: bptr(1)},
+	0x21: {ReceiveMaximum: new(uint16(100))},
+	0x22: {TopicAliasMaximum: new(uint16(10))},
+	0x23: {TopicAlias: new(uint16(7))},
+	0x24: {MaximumQoS: new(byte(1))},
+	0x25: {RetainAvailable: new(byte(1))},
 	0x26: {UserProperties: []UserProperty{{Key: "k", Value: "v"}}},
-	0x27: {MaximumPacketSize: u32ptr(1048576)},
-	0x28: {WildcardSubAvailable: bptr(1)},
-	0x29: {SubIDAvailable: bptr(1)},
-	0x2A: {SharedSubAvailable: bptr(1)},
+	0x27: {MaximumPacketSize: new(uint32(1048576))},
+	0x28: {WildcardSubAvailable: new(byte(1))},
+	0x29: {SubIDAvailable: new(byte(1))},
+	0x2A: {SharedSubAvailable: new(byte(1))},
 }
 
 // propBlock frames content as an MQTT property block: a variable-byte

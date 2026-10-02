@@ -38,7 +38,7 @@ help: ## show this help
 # goimports stays on @latest deliberately: it has no gate of its own,
 # gofumpt is the formatting authority.
 GOFUMPT_VERSION       ?= v0.11.0
-GOLANGCI_LINT_VERSION ?= v2.12.2
+GOLANGCI_LINT_VERSION ?= v2.13.0
 GOVULNCHECK_VERSION   ?= v1.8.0
 
 .PHONY: setup

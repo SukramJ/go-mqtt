@@ -106,10 +106,10 @@ func FuzzReadFrame(f *testing.F) {
 	f.Add(seedBytes(f, (&ConnectPacket{Version: V311, ClientID: "c1", KeepAlive: 30}).Encode))
 	f.Add(seedBytes(f, (&ConnectPacket{
 		Version: V50, ClientID: "c2", KeepAlive: 60, CleanStart: true,
-		Properties: &Properties{SessionExpiryInterval: u32ptr(120)},
+		Properties: &Properties{SessionExpiryInterval: new(uint32(120))},
 		Will: &Will{
 			Topic: "lwt", Payload: []byte("bye"), QoS: 1,
-			Properties: &Properties{WillDelayInterval: u32ptr(5)},
+			Properties: &Properties{WillDelayInterval: new(uint32(5))},
 		},
 	}).Encode))
 
@@ -125,7 +125,7 @@ func FuzzReadFrame(f *testing.F) {
 	}).Encode))
 	f.Add(seedBytes(f, (&PublishPacket{
 		Version: V50, Topic: "", Payload: []byte("aliased"), QoS: 0,
-		Properties: &Properties{TopicAlias: u16ptr(3)},
+		Properties: &Properties{TopicAlias: new(uint16(3))},
 	}).Encode))
 	f.Add(seedBytes(f, (&PublishPacket{
 		Version: V50, Topic: "a/b", Payload: []byte("hi"), QoS: 2, PacketID: 9,
@@ -291,7 +291,7 @@ func FuzzPublishRoundTrip(f *testing.F) {
 			pkt.PacketID = uint16(flags) + 1 // arithmetic on a byte: never wraps to 0
 		}
 		if version == V50 && flags&0x20 != 0 {
-			pkt.Properties = &Properties{TopicAlias: u16ptr(uint16(flags) + 1)}
+			pkt.Properties = &Properties{TopicAlias: new(uint16(flags) + 1)}
 		}
 
 		var buf1 bytes.Buffer

@@ -116,9 +116,7 @@ func TestIDAllocatorConcurrent(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range 32 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range 500 {
 				id, gen, err := a.Acquire()
 				if err != nil {
@@ -137,7 +135,7 @@ func TestIDAllocatorConcurrent(t *testing.T) {
 				mu.Unlock()
 				a.ReleaseAt(id, gen)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 }
@@ -340,9 +338,7 @@ func TestQuotaConcurrentBound(t *testing.T) {
 	var inFlight, maxSeen atomic.Int64
 	var wg sync.WaitGroup
 	for range 64 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range 200 {
 				gen, err := q.acquire(ctx)
 				if err != nil {
@@ -362,7 +358,7 @@ func TestQuotaConcurrentBound(t *testing.T) {
 				inFlight.Add(-1)
 				q.releaseAt(gen)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	if maxSeen.Load() > ceiling {

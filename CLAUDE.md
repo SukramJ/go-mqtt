@@ -21,7 +21,7 @@ upgrade path and [CHANGELOG.md](./CHANGELOG.md) for what changed.
 
 ## Key Characteristics
 
-- **Language**: Go 1.26+ (see `go.mod`).
+- **Language**: Go 1.27+ (see `go.mod`).
 - **Module path**: `github.com/SukramJ/go-mqtt` (unchanged across the
   v1.0 rewrite — no `/v2` suffix; v1.0 is a breaking change accepted by
   every consumer at upgrade time, not a parallel major version).

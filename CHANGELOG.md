@@ -5,11 +5,17 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-02
+
+### Changed
+
+- **Requires Go 1.27.** The module's `go` directive is now `go 1.27`, so
+  consumers must build with Go 1.27 or newer. No exported signature and
+  nothing on the wire changes.
+
 ### Documentation
 
-No code changes: nothing exported moves, nothing on the wire changes,
-and there is no reason for a consumer to re-pin. Not tagged for that
-reason — the next release folds this section in.
+No code changes: nothing exported moves and nothing on the wire changes.
 
 - **`WithSubscriptionID` is documented.** It appeared in v1.5.0 and
   changed behaviour in v1.5.1 without a single mention in `README.md` or

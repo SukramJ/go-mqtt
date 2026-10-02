@@ -36,6 +36,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/SukramJ/go-mqtt/protocol"
@@ -157,8 +158,7 @@ func TestLifecycleFlappingBrokerIsDamped(t *testing.T) {
 		FlapWindow:     time.Hour,
 	}, f)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := lc.Start(ctx); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -207,8 +207,7 @@ func TestLifecycleStableConnectionReconnectsImmediately(t *testing.T) {
 		FlapWindow:     -1, // flap detection off: every loss counts as stable
 	}, s)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := lc.Start(ctx); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -510,13 +509,12 @@ func (p *scriptedPublisher) Publish(context.Context, string, []byte, QoS, bool, 
 }
 
 // newEpochBreaker wires a breaker with a single probe slot, a one-failure
-// trip and a fake clock, the shape both straggler scenarios need.
-func newEpochBreaker(p Publisher, clk *fakeClock) *Breaker {
+// trip, the shape both straggler scenarios need.
+func newEpochBreaker(p Publisher) *Breaker {
 	return NewBreaker(p, BreakerConfig{
 		FailureThreshold: 1,
 		RecoveryTimeout:  10 * time.Second,
 		HalfOpenMax:      1,
-		now:              clk.Now,
 	})
 }
 
@@ -529,52 +527,53 @@ func newEpochBreaker(p Publisher, clk *fakeClock) *Breaker {
 func TestBreakerStragglerNeutralOutcomeDoesNotFreeAProbeSlot(t *testing.T) {
 	t.Parallel()
 
-	clk := newFakeClock()
-	p := newScriptedPublisher()
-	p.script(1, ErrPacketTooLarge, true) // straggler admitted while closed, neutral outcome
-	p.script(2, ErrConnectionLost, false)
-	p.script(3, nil, true) // the real half-open probe, still in flight
-	b := newEpochBreaker(p, clk)
+	synctest.Test(t, func(t *testing.T) {
+		p := newScriptedPublisher()
+		p.script(1, ErrPacketTooLarge, true) // straggler admitted while closed, neutral outcome
+		p.script(2, ErrConnectionLost, false)
+		p.script(3, nil, true) // the real half-open probe, still in flight
+		b := newEpochBreaker(p)
 
-	straggler := make(chan struct{})
-	go func() {
-		defer close(straggler)
-		_ = publishOnce(t, b)
-	}()
-	<-p.enteredCh(1)
+		straggler := make(chan struct{})
+		go func() {
+			defer close(straggler)
+			_ = publishOnce(t, b)
+		}()
+		<-p.enteredCh(1)
 
-	if err := publishOnce(t, b); !errors.Is(err, ErrConnectionLost) {
-		t.Fatalf("trip publish: got %v, want ErrConnectionLost", err)
-	}
-	if got := b.State(); got != BreakerOpen {
-		t.Fatalf("state after the trip: %v, want open", got)
-	}
+		if err := publishOnce(t, b); !errors.Is(err, ErrConnectionLost) {
+			t.Fatalf("trip publish: got %v, want ErrConnectionLost", err)
+		}
+		if got := b.State(); got != BreakerOpen {
+			t.Fatalf("state after the trip: %v, want open", got)
+		}
 
-	clk.Advance(11 * time.Second)
-	probe := make(chan struct{})
-	go func() {
-		defer close(probe)
-		_ = publishOnce(t, b)
-	}()
-	<-p.enteredCh(3)
-	if got := b.State(); got != BreakerHalfOpen {
-		t.Fatalf("state with a probe in flight: %v, want half-open", got)
-	}
+		reachRecovery(t, b, 10*time.Second)
+		probe := make(chan struct{})
+		go func() {
+			defer close(probe)
+			_ = publishOnce(t, b)
+		}()
+		<-p.enteredCh(3)
+		if got := b.State(); got != BreakerHalfOpen {
+			t.Fatalf("state with a probe in flight: %v, want half-open", got)
+		}
 
-	// The straggler now reports its neutral outcome into the half-open
-	// state it was never admitted in.
-	p.release(1)
-	<-straggler
+		// The straggler now reports its neutral outcome into the half-open
+		// state it was never admitted in.
+		p.release(1)
+		<-straggler
 
-	if err := publishOnce(t, b); !errors.Is(err, ErrCircuitOpen) {
-		t.Fatalf("second concurrent probe: got %v, want ErrCircuitOpen", err)
-	}
-	if got := p.count(); got != 3 {
-		t.Fatalf("wrapped Publisher reached %d times, want 3 — the straggler freed a probe slot it never held", got)
-	}
+		if err := publishOnce(t, b); !errors.Is(err, ErrCircuitOpen) {
+			t.Fatalf("second concurrent probe: got %v, want ErrCircuitOpen", err)
+		}
+		if got := p.count(); got != 3 {
+			t.Fatalf("wrapped Publisher reached %d times, want 3 — the straggler freed a probe slot it never held", got)
+		}
 
-	p.release(3)
-	<-probe
+		p.release(3)
+		<-probe
+	})
 }
 
 // TestBreakerStragglerSuccessDoesNotCloseHalfOpen proves a success from a
@@ -585,43 +584,44 @@ func TestBreakerStragglerNeutralOutcomeDoesNotFreeAProbeSlot(t *testing.T) {
 func TestBreakerStragglerSuccessDoesNotCloseHalfOpen(t *testing.T) {
 	t.Parallel()
 
-	clk := newFakeClock()
-	p := newScriptedPublisher()
-	p.script(1, nil, true) // straggler admitted while closed, succeeds late
-	p.script(2, ErrConnectionLost, false)
-	p.script(3, nil, true) // the real probe
-	b := newEpochBreaker(p, clk)
+	synctest.Test(t, func(t *testing.T) {
+		p := newScriptedPublisher()
+		p.script(1, nil, true) // straggler admitted while closed, succeeds late
+		p.script(2, ErrConnectionLost, false)
+		p.script(3, nil, true) // the real probe
+		b := newEpochBreaker(p)
 
-	straggler := make(chan struct{})
-	go func() {
-		defer close(straggler)
-		_ = publishOnce(t, b)
-	}()
-	<-p.enteredCh(1)
+		straggler := make(chan struct{})
+		go func() {
+			defer close(straggler)
+			_ = publishOnce(t, b)
+		}()
+		<-p.enteredCh(1)
 
-	if err := publishOnce(t, b); !errors.Is(err, ErrConnectionLost) {
-		t.Fatalf("trip publish: got %v, want ErrConnectionLost", err)
-	}
-	clk.Advance(11 * time.Second)
-	probe := make(chan struct{})
-	go func() {
-		defer close(probe)
-		_ = publishOnce(t, b)
-	}()
-	<-p.enteredCh(3)
+		if err := publishOnce(t, b); !errors.Is(err, ErrConnectionLost) {
+			t.Fatalf("trip publish: got %v, want ErrConnectionLost", err)
+		}
+		reachRecovery(t, b, 10*time.Second)
+		probe := make(chan struct{})
+		go func() {
+			defer close(probe)
+			_ = publishOnce(t, b)
+		}()
+		<-p.enteredCh(3)
 
-	p.release(1)
-	<-straggler
-	if got := b.State(); got != BreakerHalfOpen {
-		t.Fatalf("state after a straggler success: %v, want half-open (the real probe has not reported yet)", got)
-	}
+		p.release(1)
+		<-straggler
+		if got := b.State(); got != BreakerHalfOpen {
+			t.Fatalf("state after a straggler success: %v, want half-open (the real probe has not reported yet)", got)
+		}
 
-	// Only the probe's own outcome may close the circuit.
-	p.release(3)
-	<-probe
-	if got := b.State(); got != BreakerClosed {
-		t.Fatalf("state after the probe succeeded: %v, want closed", got)
-	}
+		// Only the probe's own outcome may close the circuit.
+		p.release(3)
+		<-probe
+		if got := b.State(); got != BreakerClosed {
+			t.Fatalf("state after the probe succeeded: %v, want closed", got)
+		}
+	})
 }
 
 // TestLifecycleJitterNeverCollapsesBackoff proves a Jitter at or above the
@@ -1167,8 +1167,7 @@ func TestLifecycleDrainsStaleConnectionLostToken(t *testing.T) {
 		FlapWindow:     -1, // flap detection off: a loss event would reconnect immediately
 	}, s)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := lc.Start(ctx); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -1359,13 +1358,11 @@ func TestOnStateChangeChainUnderConcurrency(t *testing.T) {
 	ctx := context.Background()
 	var wg sync.WaitGroup
 	for range 8 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range 200 {
 				_ = b.Publish(ctx, "chain/t", []byte("x"), QoS1, false)
 			}
-		}()
+		})
 	}
 	for range 20 {
 		p.fail.Store(!p.fail.Load())

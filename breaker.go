@@ -80,8 +80,6 @@ type BreakerConfig struct {
 	// after it returns, in order). Keep it quick anyway — it runs inline
 	// on a publish path.
 	OnStateChange func(from, to BreakerState)
-	// now is the clock seam for tests; nil uses time.Now.
-	now func() time.Time
 }
 
 // Breaker is a circuit-breaking [Publisher] decorator.
@@ -163,9 +161,6 @@ func NewBreaker(pub Publisher, cfg BreakerConfig) *Breaker {
 	if cfg.HalfOpenMax <= 0 {
 		cfg.HalfOpenMax = 1
 	}
-	if cfg.now == nil {
-		cfg.now = time.Now
-	}
 	return &Breaker{pub: pub, cfg: cfg}
 }
 
@@ -203,7 +198,7 @@ func (b *Breaker) admit() (adm admission, admitted bool, transition func()) {
 	case BreakerClosed:
 		return admission{epoch: b.epoch}, true, nil
 	case BreakerOpen:
-		if b.cfg.now().Sub(b.openedAt) < b.cfg.RecoveryTimeout {
+		if time.Since(b.openedAt) < b.cfg.RecoveryTimeout {
 			return admission{}, false, nil
 		}
 		fire := b.transitionLocked(BreakerHalfOpen)
@@ -281,7 +276,7 @@ func (b *Breaker) recordFailure(adm admission) func() {
 	case BreakerHalfOpen:
 		// A failed probe re-opens immediately and restarts the window.
 		fire := b.transitionLocked(BreakerOpen)
-		b.openedAt = b.cfg.now()
+		b.openedAt = time.Now()
 		b.probes = 0
 		b.failures = 0
 		return fire
@@ -289,7 +284,7 @@ func (b *Breaker) recordFailure(adm admission) func() {
 		b.failures++
 		if b.failures >= b.cfg.FailureThreshold {
 			fire := b.transitionLocked(BreakerOpen)
-			b.openedAt = b.cfg.now()
+			b.openedAt = time.Now()
 			b.failures = 0
 			return fire
 		}
@@ -421,8 +416,7 @@ func countableFailure(ctx context.Context, err error) bool {
 		// statement about broker health.
 		return false
 	}
-	var re *ReasonError
-	if errors.As(err, &re) {
+	if re, ok := errors.AsType[*ReasonError](err); ok {
 		return re.Code.IsError()
 	}
 	// Unknown transport-level failure (e.g. a wrapped net error from a

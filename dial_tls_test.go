@@ -180,8 +180,7 @@ func TestConnectTLSHandshakeFailsUntrustedCert(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected a certificate verification error, got nil")
 	}
-	var unknownAuth x509.UnknownAuthorityError
-	if !errors.As(err, &unknownAuth) {
+	if _, ok := errors.AsType[x509.UnknownAuthorityError](err); !ok {
 		t.Logf("Connect error (informational, not necessarily UnknownAuthorityError): %v", err)
 	}
 	if c.IsConnected() {

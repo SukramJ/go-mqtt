@@ -77,7 +77,7 @@ func TestEncodeDisconnectV5(t *testing.T) {
 // taken.
 func TestEncodeDisconnectIllegalProperty(t *testing.T) {
 	t.Parallel()
-	pkt := &DisconnectPacket{Version: V50, ReasonCode: SessionTakenOver, Properties: &Properties{TopicAlias: u16ptr(1)}}
+	pkt := &DisconnectPacket{Version: V50, ReasonCode: SessionTakenOver, Properties: &Properties{TopicAlias: new(uint16(1))}}
 	if err := pkt.Encode(&bytes.Buffer{}); !errors.Is(err, ErrProtocolViolation) {
 		t.Fatalf("got %v, want ErrProtocolViolation", err)
 	}

@@ -5,6 +5,7 @@ package mqtt
 
 import (
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/SukramJ/go-mqtt/protocol"
@@ -536,12 +537,7 @@ func (c *TCPClient) dispatch(msg *Message) {
 // produces except a shared subscription overlap, and allocating a set per
 // inbound message on the read loop would cost more than it saves.
 func containsID(ids []uint32, id uint32) bool {
-	for _, got := range ids {
-		if got == id {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(ids, id)
 }
 
 // toMessage projects a decoded PUBLISH (topic already alias-resolved) into
