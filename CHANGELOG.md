@@ -5,6 +5,12 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Requires Go 1.27.** The module's `go` directive is now `go 1.27`, so
+  consumers must build with Go 1.27 or newer. No exported signature and
+  nothing on the wire changes.
+
 ### Documentation
 
 No code changes: nothing exported moves, nothing on the wire changes,
