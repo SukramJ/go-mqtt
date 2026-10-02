@@ -421,8 +421,7 @@ func countableFailure(ctx context.Context, err error) bool {
 		// statement about broker health.
 		return false
 	}
-	var re *ReasonError
-	if errors.As(err, &re) {
+	if re, ok := errors.AsType[*ReasonError](err); ok {
 		return re.Code.IsError()
 	}
 	// Unknown transport-level failure (e.g. a wrapped net error from a

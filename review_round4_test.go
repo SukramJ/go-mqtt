@@ -157,8 +157,7 @@ func TestLifecycleFlappingBrokerIsDamped(t *testing.T) {
 		FlapWindow:     time.Hour,
 	}, f)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := lc.Start(ctx); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -207,8 +206,7 @@ func TestLifecycleStableConnectionReconnectsImmediately(t *testing.T) {
 		FlapWindow:     -1, // flap detection off: every loss counts as stable
 	}, s)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := lc.Start(ctx); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -1167,8 +1165,7 @@ func TestLifecycleDrainsStaleConnectionLostToken(t *testing.T) {
 		FlapWindow:     -1, // flap detection off: a loss event would reconnect immediately
 	}, s)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	if err := lc.Start(ctx); err != nil {
 		t.Fatalf("start: %v", err)
 	}
@@ -1359,13 +1356,11 @@ func TestOnStateChangeChainUnderConcurrency(t *testing.T) {
 	ctx := context.Background()
 	var wg sync.WaitGroup
 	for range 8 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for range 200 {
 				_ = b.Publish(ctx, "chain/t", []byte("x"), QoS1, false)
 			}
-		}()
+		})
 	}
 	for range 20 {
 		p.fail.Store(!p.fail.Load())

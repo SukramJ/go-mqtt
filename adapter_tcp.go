@@ -584,10 +584,7 @@ func (c *TCPClient) applySession(result ConnectResult) {
 		_ = c.store.Reset()
 		c.ids.Reset()
 	}
-	size := c.quotaSize(result) - c.inflightPermits()
-	if size < 0 {
-		size = 0
-	}
+	size := max(c.quotaSize(result)-c.inflightPermits(), 0)
 	c.quota.reset(size)
 }
 

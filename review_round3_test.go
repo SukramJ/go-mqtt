@@ -43,9 +43,7 @@ func TestConcurrentConnectEstablishesSingleLink(t *testing.T) {
 	var ok, already atomic.Int32
 	var wg sync.WaitGroup
 	for range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 			defer cancel()
 			switch err := c.Connect(ctx); {
@@ -56,7 +54,7 @@ func TestConcurrentConnectEstablishesSingleLink(t *testing.T) {
 			default:
 				t.Errorf("Connect: %v", err)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 
