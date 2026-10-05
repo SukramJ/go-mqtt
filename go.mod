@@ -1,3 +1,3 @@
 module github.com/SukramJ/go-mqtt
 
-go 1.27
+go 1.27.1
