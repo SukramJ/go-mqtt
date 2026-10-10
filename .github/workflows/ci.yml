@@ -23,7 +23,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION: "1.27.1"
+  GO_VERSION: "1.27.2"
   # The tools below are pinned, not @latest. Dependabot tracks go.mod
   # requires, not go-install lines in a workflow, so these are bumped by
   # hand — deliberately: raise the version, run `make check`, and fix or
@@ -34,7 +34,7 @@ env:
   # release rewraps untouched code and reds main overnight. Keep these in
   # step with the versions `make setup` installs.
   GOFUMPT_VERSION: "v0.11.0"
-  GOLANGCI_LINT_VERSION: "v2.13.0"
+  GOLANGCI_LINT_VERSION: "v2.14.0"
 
 jobs:
   lint:
