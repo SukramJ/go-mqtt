@@ -5,6 +5,12 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Security
+
+- Built with Go 1.27.2, which fixes Go standard-library vulnerabilities
+  (net/http and HTTP/2, crypto/tls, net/textproto, html/template).
+- golangci-lint v2.14.0 (reads Go 1.27.2's export data).
+
 ## [1.6.0] - 2026-10-02
 
 ### Changed
