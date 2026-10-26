@@ -5,11 +5,28 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.7.0] - 2026-10-26
+
+### Added
+
+- **`NewClientTLSConfigWithCA(serverName, caFile, insecureSkipVerify)`**
+  for a broker whose certificate chains to a private CA. A non-empty
+  `caFile` (PEM, one or more CA certificates) becomes the config's
+  `RootCAs` and replaces the system trust store for that connection; an
+  empty one makes the call identical to `NewClientTLSConfig`. Every
+  problem with the file is an error instead of a silent fallback to the
+  system roots — unreadable, no certificate in it, a `CERTIFICATE` block
+  that does not parse, or a non-certificate block such as a private key —
+  and the error names the file and the offending block. Asking for a CA
+  and `insecureSkipVerify` at once is refused with the new
+  `ErrInsecureWithCA`, since verification would be off and the CA never
+  consulted. Purely additive: `NewClientTLSConfig` is unchanged.
+
 ### Security
 
-- Built with Go 1.27.2, which fixes Go standard-library vulnerabilities
+- Built with Go 1.27.3, which fixes Go standard-library vulnerabilities
   (net/http and HTTP/2, crypto/tls, net/textproto, html/template).
-- golangci-lint v2.14.0 (reads Go 1.27.2's export data).
+- golangci-lint v2.14.0 (reads Go 1.27's export data).
 
 ## [1.6.0] - 2026-10-02
 
