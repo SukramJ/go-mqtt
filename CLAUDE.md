@@ -61,7 +61,7 @@ pump.go                  readLoop/keepAliveLoop: frame dispatch, inbound QoS 1/2
 publish.go               Publish/Subscribe/Unsubscribe: ack waiting, flow-control acquire, SUBSCRIBE/UNSUBSCRIBE request/ack plumbing
 session.go               SessionStore interface + memStore, idAllocator (packet-id bitmap), quota (send-quota semaphore)
 lifecycle.go             Lifecycle + ConnectionNotifier — reconnect loop, event-driven via a Connector's ConnectionLost(), exponential backoff + jitter; Starter/RetryConfig/ConnectWithRetry
-tls_config.go            NewClientTLSConfig — safe tls.Config construction (mandatory ServerName)
+tls_config.go            NewClientTLSConfig / NewClientTLSConfigWithCA — safe tls.Config construction (mandatory ServerName, optional PEM CA bundle)
 breaker.go               Breaker: circuit-breaking Publisher decorator (epoch-guarded state machine, ErrCircuitOpen fail-fast)
 test_mock_broker.go      in-package (non-_test.go) scripted multi-connection mock broker (v3.1.1 + v5), fault injection knobs
 protocol/                package protocol: dual-version (v3.1.1 + v5) MQTT wire codec
@@ -224,6 +224,10 @@ e2e/gencert/             standalone `go run` program generating the e2e CA + ser
   closing the common "just set InsecureSkipVerify" trap.
   `insecureSkipVerify` must only ever be an explicit, operator-driven
   opt-in from the caller — never a default.
+  `NewClientTLSConfigWithCA` adds an optional PEM CA bundle as
+  `RootCAs` (replacing the system roots); any unusable file is an error,
+  never a silent fallback, and a CA together with `insecureSkipVerify`
+  is refused (`ErrInsecureWithCA`).
 
 ## Development Commands
 

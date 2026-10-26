@@ -30,7 +30,7 @@ duplicated as `internal/mqtt`.
 | Subscription identifiers | `WithSubscriptionID`-stamped v5 subscriptions are attributed by identifier, not re-matched by topic — see [Subscription identifiers](#subscription-identifiers) for the fail-closed trade |
 | Inbound topic aliases | v5 topic alias table resolved per connection (outbound aliasing is out of scope) |
 | Last Will and Testament | v3.1.1 topic/payload/QoS/retain; v5 adds will properties (delay interval, message expiry, content type, correlation data, user properties) |
-| TLS | `NewClientTLSConfig` helper — always sets `ServerName`, never defaults to `InsecureSkipVerify` |
+| TLS | `NewClientTLSConfig` / `NewClientTLSConfigWithCA` helpers — always set `ServerName`, optional private-CA bundle, never default to `InsecureSkipVerify` |
 | Reconnect lifecycle | `Lifecycle`: exponential backoff + jitter, event-driven via `ConnectionLost()` (immediate reconnect + backoff reset on a drop of a connection that had been stable for `FlapWindow`, not just idle polling; a faster drop is treated as flapping and backs off instead) |
 | Dependencies | Zero third-party — standard library only, including tests |
 
@@ -98,6 +98,27 @@ _ = client.Publish(context.Background(), "bridge/status", []byte("online"), mqtt
 For a `tls://` broker, set `TCPConfig.TLSConfig` —
 `NewClientTLSConfig` builds a `*tls.Config` with the mandatory
 `ServerName` set correctly.
+
+A broker whose certificate is signed by a private CA (typical on a local
+network) needs that CA as the trust anchor. `NewClientTLSConfigWithCA`
+loads a PEM bundle into `RootCAs` and fails on a missing or unusable
+file, so call it at startup:
+
+```go
+tlsCfg, err := mqtt.NewClientTLSConfigWithCA("broker.lan", "/ssl/ca.crt", false)
+if err != nil {
+	log.Fatal(err) // names the file and what is wrong with it
+}
+client := mqtt.NewTCPClient(mqtt.TCPConfig{
+	BrokerURL: "tls://broker.lan:8883",
+	ClientID:  "my-bridge",
+	TLSConfig: tlsCfg,
+})
+```
+
+An empty CA path keeps the system trust store. `insecureSkipVerify`
+switches certificate verification off entirely; it must only ever be an
+explicit operator opt-in, and it cannot be combined with a CA file.
 
 ### MQTT 3.1.1 and v5 properties
 
