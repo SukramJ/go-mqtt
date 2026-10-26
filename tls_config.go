@@ -28,7 +28,7 @@ import (
 // net, not the documented path.
 //
 // insecureSkipVerify must only be true when the operator has
-// explicitly opted in (config key MQTT_SSL_INSECURE) for a broker with
+// explicitly opted in (the bridges' MQTT_TLS_INSECURE) for a broker with
 // a self-signed certificate the operator controls. It must never
 // default to true — doing so would silently accept any certificate,
 // including one presented by a man-in-the-middle.
@@ -36,7 +36,7 @@ func NewClientTLSConfig(serverName string, insecureSkipVerify bool) *tls.Config 
 	return &tls.Config{
 		ServerName: serverName,
 		MinVersion: tls.VersionTLS12,
-		//nolint:gosec // explicit, documented opt-in via MQTT_SSL_INSECURE; never the default
+		//nolint:gosec // explicit, documented opt-in (MQTT_TLS_INSECURE in the bridges); never the default
 		InsecureSkipVerify: insecureSkipVerify,
 	}
 }
