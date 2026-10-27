@@ -384,23 +384,24 @@ discussion, they were explicitly scoped out:
 
 ## Consumers and Compatibility
 
-This module has **seven** consumers, every one of them currently pinned
-to the same release (verified against each repository's `go.mod` on
-`origin/main`, not from memory — re-check it the same way before
-trusting this list):
+This module has **eight** consumers (verified against each repository's
+`go.mod` on `origin/main`, not from memory — re-check it the same way
+before trusting this list). As of 2026-10-27 seven pin v1.7.0;
+`go-hamqtt` still pins v1.6.0, which is fine because v1.7.0 is purely
+additive:
 
 - `openccu-loom` — the project this client was originally written for
   and later carved out of; it consumes the extracted module too.
 - `go-mtec2mqtt`, `go-zendure2mqtt`, `go-homeconnect2mqtt`,
-  `go-daikin2mqtt`, `go-unifi2mqtt` — the bridge family.
+  `go-daikin2mqtt`, `go-unifi2mqtt`, `go-keba2mqtt` — the bridge family.
 - **`go-hamqtt`** — the shared Home Assistant model/discovery/publisher
   module (ADR 0070). It is the most consequential consumer, because it
-  sits *between* this module and the other six: all six import
+  sits *between* this module and the other seven: all seven import
   `go-hamqtt`, and `go-hamqtt`'s `publisher/gomqtt` is where its
   transport meets this client. A break here can therefore reach a
   bridge twice — directly, and again through `go-hamqtt`'s pin.
 
-**A breaking change here breaks all seven at once**, and the ones that
+**A breaking change here breaks all eight at once**, and the ones that
 go through `go-hamqtt` need that module to move first. Practical
 implications:
 
