@@ -429,41 +429,55 @@ implications:
 
 Set by the owner for the go-fabric family on 2026-10-10 (go-fabric's
 `CLAUDE.md`); the review split of 2026-11-08 (go-fabric #456) likewise.
-Adopted here on 2026-11-08. A statement about the MQTT specification that
-lands in this repo is cited later as fact — a comment that names a caller
-or a consumer, a docstring that states what the other side does, a
-`CHANGELOG.md` line — so the work that produces such statements gets
-the strongest model, and the work a guard checks may use a cheaper one. The
-agents in [Sub-Agent Delegation](#sub-agent-delegation) carry a default
-model each; the rows below decide when a call overrides it (`model:` on the
-Agent tool). Implementation defaults to Opus.
+Adopted here on 2026-11-08; re-cut by the owner on 2026-11-15, mirrored
+from go-fabric #529 and openccu-loom #1108 (in the owner's words: "Wichtig
+ist, dass die Qualität hoch ist, aber Fable gezielt für die Dinge eingesetzt
+wird, die es wirklich besser kann"). The bar is unchanged: a statement about
+the MQTT specification that lands in this repo is cited later as fact — a
+comment that names a caller or a consumer, a docstring that states what the
+other side does, a `CHANGELOG.md` line — so it comes from the strongest
+model. But the strongest model does only the part that needs it: reading the
+reference and judging. The writing, the mechanics and the code review are
+Opus. The agents in [Sub-Agent Delegation](#sub-agent-delegation) carry a
+default model each; the rows below decide when a call overrides it (`model:`
+on the Agent tool). Implementation defaults to Opus.
 
 | Work | Model |
 | --- | --- |
-| Analysis, planning, reviews of design, audits; anything written into `CHANGELOG.md`, `MIGRATION.md` or a non-goal in `CLAUDE.md`, or a comment that names an MQTT 5.0 or 3.1.1 specification behaviour (OASIS mqtt-v5.0-os, mqtt-v3.1.1-os) or a consumer's expectation; `tls_config.go`, the CONNECT credential encoding and the AUTH packet handling; *which* guard gets built and its bite line; rebases and merge conflicts where `main` may have overtaken the change | **Fable** (the default for this repo; also the `hunt` agent) |
-| Implementation of a finished plan with guards behind it: a packet field once the pattern exists, a goldenfile vector, a test on an existing pattern, a `CHANGELOG.md` entry for a finished diff | **Opus** (the `impl` default; also what fast mode runs on) |
-| **Review of a slice's pull request, split (owner decision 2026-11-08, go-fabric #456).** The code review — correctness, concurrency, error paths, tests, the fixed report shape — is **Opus**. On top of it **Fable** reads, bounded: every new comment or docstring that names an MQTT 5.0 or 3.1.1 specification behaviour (OASIS mqtt-v5.0-os, mqtt-v3.1.1-os) or a consumer's expectation against the OASIS specification section cited, the goldenfile vectors, every line that enters `CHANGELOG.md`, `MIGRATION.md` or a non-goal in `CLAUDE.md`, the paths of the first row, and the brief's decisions against the reference — the behavioural gaps a code review does not see. The load-bearing claims of the Opus review are verified before they reach the implementer. | **Opus**, then **Fable** |
+| **Coordination** of a slice: starting agents, integrating, guards, pull requests, status | **Opus**, in a fresh session per slice (the state is in the notes and the memory, never in a long context) |
+| **Planning and decisions:** the slice plan; the decision briefs for the owner, design reviews and audits; *which* guard gets built and its bite line; the verdict where the MQTT 5.0 and 3.1.1 specifications (OASIS mqtt-v5.0-os, mqtt-v3.1.1-os) and a consumer's expectation contradict each other | **Fable**, as a targeted agent |
+| **Reading the reference and judging:** what the MQTT 5.0 or 3.1.1 specification (OASIS mqtt-v5.0-os, mqtt-v3.1.1-os) requires at the section cited, what a consumer expects, and what this repo's own code does (who calls, who consumes) — for `CHANGELOG.md`, `MIGRATION.md`, a non-goal in `CLAUDE.md`, the goldenfile vectors and every comment or docstring that names a specification behaviour, a caller or a consumer's expectation; the adversarial read of the `hunt` agent | **Fable** gives the verdict with the lines as a short fact note; **Opus** writes the entry or the comment in the file's form; **Fable** reads the finished text once against its note. Every reference statement comes from Fable |
+| **Implementation**, also on the paths [Sub-Agent Delegation](#sub-agent-delegation) keeps out of an agent's hands (the public API, the wire encoding, `tls_config.go`, the CONNECT credential encoding and the AUTH packet handling); a packet field, a goldenfile vector; tests; CHANGELOG and docs; rebases and merge conflicts | **Opus** (the `impl` default; also what fast mode runs on) — with the Fable read of the next row before it merges where it touches one of those paths or mirrors the specification |
+| **Review** of a slice's pull request | **Opus** does the code review — correctness, concurrency, error paths, tests, the fixed report shape. **Fable** reads on top, bounded: behaviour against the OASIS specification section cited and the goldenfile vectors, the paths of the row above, and every finding of high or medium severity for confirmation before it reaches an implementer |
+| **Citations** | **Opus** checks every range (the specification section or conformance statement, the file, the lines, the construct the sentence names). **Fable** reads every citation that is the reason for behaviour (a `§3.3.4` or `[MQTT-2.2.1-3]` a code path rests on), every doubtful one and a sample of the rest |
 | Work a test or generator checks immediately: `make fmt`, a table case; search and first reading of a tree whose result a stronger model or the owner reads again | **Sonnet** (the `guard` default; `impl` with `model: "sonnet"`) |
 | Mechanical inventories whose answer is a list the caller can re-grep: which files reference X, which links are dead, which entries lack a counterpart | **Haiku** (`sweep` default) |
 
-Sonnet never writes a claim about an MQTT 5.0 or 3.1.1 specification behaviour (OASIS mqtt-v5.0-os, mqtt-v3.1.1-os) or a consumer's expectation into the repo, and
-never touches the paths named in the first row. Haiku returns lists, never
-verdicts. When in doubt about which row a task is in, it is in the first.
+Sonnet never writes a claim about an MQTT 5.0 or 3.1.1 specification
+behaviour (OASIS mqtt-v5.0-os, mqtt-v3.1.1-os) or a consumer's expectation
+into the repo. Opus does not either: it writes what Fable's fact note
+states. Haiku returns lists, never verdicts. When in doubt whether a
+statement is a reference fact, it is one.
 
 ---
 
 ## Sub-Agent Delegation
 
 As go-fabric's and openccu-loom's rule (owner, 2026-10-10). The main
-conversation owns planning, contract and wire decisions, guard
-specifications, sub-agent steering, and final verification. It does not own
-typing.
+conversation coordinates: integration, guards, sub-agent steering, final
+verification, and push / pull request / tag. Planning, contract and wire
+decisions and guard specifications come from Fable (the planning row of
+[Which model does which work](#which-model-does-which-work)) and reach the
+coordinator as a plan or a fact note. It still does not own typing.
 
 **Delegate what a gate can prove; keep what only a reader can accept.**
 Delegate freely: table cases, fakes, scaffolding, fixture updates, doc and
 link cleanups, version bumps across the changelog set, inventories and grep
-sweeps. Never delegate: the public API, the wire encoding, `tls_config.go`, credential handling, and *which* guard gets
-built. Locating is delegable; reading is not.
+sweeps. Never delegate to an agent: the public API, the wire encoding,
+`tls_config.go`, credential handling — those are implemented in the
+coordinating session, and the stop conditions of `.claude/agents/impl.md`
+keep them out; *which* guard gets built is Fable's. Locating is delegable;
+reading is not.
 
 | Agent | Default model | Use for |
 |---|---|---|
@@ -544,6 +558,32 @@ doubling.
 - **Edit by script.** Several replacements in several files are one
   scripted call with asserted anchors, not a chain of interactive edits;
   a generated file (the e2e certificates (`make e2e-certs`)) is regenerated, never patched.
+- **The strongest model for the part that needs it.** Set by the owner on
+  2026-11-15. Fable reads references, judges and plans (the table above);
+  it does not coordinate, format, write prose or run mechanics. A Fable
+  agent's brief is bounded: the lines to read, the question to answer, a
+  fact note back.
+- **Few turns in a long session.** A coordinator waits for several agents
+  at once and integrates them together; a status message carries new
+  information or is not sent; a slice starts in a fresh session.
+- **The assistant says when to clear the context.** Set by the owner on
+  2026-11-15. It does not wait to be asked: it proposes a fresh session
+  when a slice or a pull request is merged; when the context has been
+  summarised once and the work that remains is of another kind; or when
+  what it still needs fits in a short hand-over and the turns are mostly
+  waiting for agents or pipelines. It does NOT propose one while agents of
+  the session are running or a decision of the owner is open. The proposal
+  comes with the hand-over already written — the state, the open points
+  with where each goes, the next step, the lessons — into the memory file
+  and the notes (never only into the chat), and with the exact way to go
+  on: `/clear`, the model to switch to (`/model`), and the first message
+  to send, which names the files to read.
+- **The pipeline's guards before the pull request, not after.** The local
+  guard set is the full gate — `make check` (vet, fmt-check, lint, test),
+  `make cover-check` and `make fuzz-smoke` — which covers the lint, test
+  and fuzz-smoke jobs of `.github/workflows/ci.yml`; its e2e job runs
+  `make e2e-up`, `make test-e2e` and `make e2e-down` (Docker). A red
+  pipeline costs a round of coordinator turns.
 - **Agents read what the brief names.** An implementing agent gets the
   file list and the pinned sources in the brief, reads those, and reports
   in the fixed shape; it does not survey the tree. One agent per brief;
