@@ -33,7 +33,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SukramJ/go-mqtt/protocol"
+	"sukramj.dev/go-mqtt/protocol"
 )
 
 // mockMaxRemainingLength bounds the frames the broker will read from a

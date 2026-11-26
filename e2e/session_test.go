@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	mqtt "github.com/SukramJ/go-mqtt"
+	mqtt "sukramj.dev/go-mqtt"
 )
 
 // TestSessionResumptionQueuedMessage exercises persistent-session

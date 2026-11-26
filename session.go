@@ -10,7 +10,7 @@ import (
 	"slices"
 	"sync"
 
-	"github.com/SukramJ/go-mqtt/protocol"
+	"sukramj.dev/go-mqtt/protocol"
 )
 
 // StoredKind classifies a [StoredMessage] held in a [SessionStore]. It

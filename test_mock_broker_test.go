@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SukramJ/go-mqtt/protocol"
+	"sukramj.dev/go-mqtt/protocol"
 )
 
 // mockTestClient is a hand-rolled MQTT peer used only to poke at

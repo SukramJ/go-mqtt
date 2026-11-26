@@ -26,7 +26,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SukramJ/go-mqtt/protocol"
+	"sukramj.dev/go-mqtt/protocol"
 )
 
 // TestNewTCPClientAppliesDefaults proves the zero-value timing/limit

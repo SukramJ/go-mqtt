@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SukramJ/go-mqtt/protocol"
+	"sukramj.dev/go-mqtt/protocol"
 )
 
 func assertNoReceive(t *testing.T, ch <-chan error, d time.Duration) {

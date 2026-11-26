@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	mqtt "github.com/SukramJ/go-mqtt"
+	mqtt "sukramj.dev/go-mqtt"
 )
 
 // TestV5MessageExpiry publishes a QoS 1 message with a 1-second Message

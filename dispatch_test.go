@@ -27,7 +27,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SukramJ/go-mqtt/protocol"
+	"sukramj.dev/go-mqtt/protocol"
 )
 
 // TestDispatchOverlappingFiltersFireInRegistrationOrder subscribes three

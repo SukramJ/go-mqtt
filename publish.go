@@ -11,7 +11,7 @@ import (
 	"io"
 	"time"
 
-	"github.com/SukramJ/go-mqtt/protocol"
+	"sukramj.dev/go-mqtt/protocol"
 )
 
 // errAckTimeout is returned when an acknowledgement does not arrive within

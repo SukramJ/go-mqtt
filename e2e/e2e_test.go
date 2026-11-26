@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2026 OpenCCU-Loom authors.
 
-// Package e2e exercises [github.com/SukramJ/go-mqtt] against real MQTT
+// Package e2e exercises [sukramj.dev/go-mqtt] against real MQTT
 // brokers (mosquitto and emqx) reachable over the network. Every test is
 // env-gated: it t.Skip()s cleanly when the broker environment variable it
 // needs is unset, or when a short TCP dial probe against that address
@@ -26,7 +26,7 @@ import (
 	"testing"
 	"time"
 
-	mqtt "github.com/SukramJ/go-mqtt"
+	mqtt "sukramj.dev/go-mqtt"
 )
 
 // Environment variables gating each broker endpoint / feature. See the
