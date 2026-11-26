@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	mqtt "github.com/SukramJ/go-mqtt"
-	"github.com/SukramJ/go-mqtt/protocol"
+	mqtt "sukramj.dev/go-mqtt"
+	"sukramj.dev/go-mqtt/protocol"
 )
 
 // TestConnect exercises a plain CONNECT/CONNACK round trip against both

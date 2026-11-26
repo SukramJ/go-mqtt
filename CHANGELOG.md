@@ -5,6 +5,14 @@ format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-11-26
+
+### Changed
+
+- **Breaking:** the module path is now `sukramj.dev/go-mqtt` (was
+  `github.com/SukramJ/go-mqtt`). Update imports and `go.mod`; the vanity
+  path resolves to the same repository.
+
 ## [1.7.0] - 2026-10-26
 
 ### Added

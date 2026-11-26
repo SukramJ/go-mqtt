@@ -1,3 +1,3 @@
-module github.com/SukramJ/go-mqtt
+module sukramj.dev/go-mqtt
 
 go 1.27.4

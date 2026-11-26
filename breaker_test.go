@@ -22,7 +22,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/SukramJ/go-mqtt/protocol"
+	"sukramj.dev/go-mqtt/protocol"
 )
 
 // fakePublisher is a scriptable Publisher stand-in: each call pulls the

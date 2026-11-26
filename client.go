@@ -3,7 +3,7 @@
 
 // Package mqtt is a minimal, dependency-free MQTT 3.1.1 and 5.0 client
 // library: a reconnecting TCP/TLS adapter over the wire codec in
-// [github.com/SukramJ/go-mqtt/protocol]. The root package defines the
+// [sukramj.dev/go-mqtt/protocol]. The root package defines the
 // version-agnostic client contracts ([Publisher], [Subscriber], [Client]),
 // the inbound [Message] shape and [MessageHandler] dispatch rules, the
 // publish/subscribe options, and the sentinel errors consumers match on.
@@ -12,7 +12,7 @@ package mqtt
 import (
 	"context"
 
-	"github.com/SukramJ/go-mqtt/protocol"
+	"sukramj.dev/go-mqtt/protocol"
 )
 
 // QoS mirrors the MQTT Quality of Service enum (§4.3): at-most-once (0),

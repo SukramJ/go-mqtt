@@ -15,7 +15,7 @@ GOIMPORTS     ?= goimports
 GOLANGCI_LINT ?= golangci-lint
 GOVULNCHECK   ?= govulncheck
 
-MODULE := github.com/SukramJ/go-mqtt
+MODULE := sukramj.dev/go-mqtt
 
 .PHONY: help
 help: ## show this help

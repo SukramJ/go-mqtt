@@ -17,7 +17,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/SukramJ/go-mqtt/protocol"
+	"sukramj.dev/go-mqtt/protocol"
 )
 
 // quotaAvail reads the send quota's currently-available permit count.

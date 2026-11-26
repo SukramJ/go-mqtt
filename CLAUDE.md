@@ -22,8 +22,8 @@ upgrade path and [CHANGELOG.md](./CHANGELOG.md) for what changed.
 ## Key Characteristics
 
 - **Language**: Go 1.27+ (see `go.mod`).
-- **Module path**: `github.com/SukramJ/go-mqtt` (unchanged across the
-  v1.0 rewrite — no `/v2` suffix; v1.0 is a breaking change accepted by
+- **Module path**: `sukramj.dev/go-mqtt` (`github.com/SukramJ/go-mqtt` before 1.8.0;
+  unchanged across the v1.0 rewrite — no `/v2` suffix; v1.0 is a breaking change accepted by
   every consumer at upgrade time, not a parallel major version).
 - **License: MIT** (not LGPL — unlike the `go-*2mqtt` bridges that
   consume this module). Provenance is
@@ -238,7 +238,7 @@ make test          # CGO_ENABLED=1 go test -race -count=1 -timeout=60s ./...
 make test-cover    # tests + coverage report (coverage.out)
 make cover-check   # per-package coverage gate (COVER_MIN=90 by default); NOT part of `check`
 make vet           # go vet ./...
-make fmt           # gofumpt -w . && goimports -w -local github.com/SukramJ/go-mqtt .
+make fmt           # gofumpt -w . && goimports -w -local sukramj.dev/go-mqtt .
 make fmt-check     # fail if gofumpt would rewrite anything (CI gate)
 make lint          # golangci-lint run ./...
 make vuln          # govulncheck ./...
@@ -318,7 +318,7 @@ Run a single package's tests directly, e.g. `go test ./protocol/...`.
   MIT` + `Copyright (C) 2026 OpenCCU-Loom authors.` (see above — do
   not change this to an LGPL header or a `SukramJ` copyright line).
 - **Formatting**: `gofumpt` (stricter gofmt) + `goimports -local
-  github.com/SukramJ/go-mqtt` for import grouping.
+  sukramj.dev/go-mqtt` for import grouping.
 - **Structured logging**: `log/slog` (enforced by `sloglint`).
 - **`golangci-lint` v2** config (`.golangci.yaml`) — same linter set as
   the `go-*2mqtt` bridges: `bodyclose`, `contextcheck`, `copyloopvar`,

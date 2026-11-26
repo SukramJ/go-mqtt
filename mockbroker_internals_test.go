@@ -27,7 +27,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/SukramJ/go-mqtt/protocol"
+	"sukramj.dev/go-mqtt/protocol"
 )
 
 // TestDecodeMockPropertiesAllKnownIDs builds one property block containing

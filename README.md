@@ -1,7 +1,7 @@
 # go-mqtt
 
 [![ci](https://github.com/SukramJ/go-mqtt/actions/workflows/ci.yml/badge.svg)](https://github.com/SukramJ/go-mqtt/actions/workflows/ci.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/SukramJ/go-mqtt.svg)](https://pkg.go.dev/github.com/SukramJ/go-mqtt)
+[![Go Reference](https://pkg.go.dev/badge/sukramj.dev/go-mqtt.svg)](https://pkg.go.dev/sukramj.dev/go-mqtt)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
 Minimal pure-Go MQTT client: a dual-version wire codec (**MQTT 5.0 by

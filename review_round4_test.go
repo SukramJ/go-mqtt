@@ -39,7 +39,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/SukramJ/go-mqtt/protocol"
+	"sukramj.dev/go-mqtt/protocol"
 )
 
 // TestTeardownPoisonsSharedStateBeforeClearingLink proves teardownLink

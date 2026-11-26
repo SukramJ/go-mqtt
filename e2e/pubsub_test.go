@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	mqtt "github.com/SukramJ/go-mqtt"
+	mqtt "sukramj.dev/go-mqtt"
 )
 
 // TestPubSubQoSRoundTrip publishes and subscribes on the same connection

@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/SukramJ/go-mqtt/protocol"
+	"sukramj.dev/go-mqtt/protocol"
 )
 
 // ErrCircuitOpen is returned by [Breaker.Publish] while the circuit is
